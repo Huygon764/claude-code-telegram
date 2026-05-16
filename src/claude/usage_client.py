@@ -113,7 +113,7 @@ async def _read_oauth_token() -> str:
             "OAuth credentials present but no accessToken (plan usage needs "
             "a Claude subscription login, not API-key auth)."
         )
-    return token
+    return str(token)
 
 
 def _parse_windows(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
