@@ -11,6 +11,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from ...claude.facade import ClaudeIntegration
+from ...claude.usage_client import UsageError, fetch_plan_usage
 from ...config.settings import Settings
 from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
@@ -915,7 +916,7 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ]
 
     if claude_session_id:
-        status_lines.append(f"🆔 Session ID: <code>{claude_session_id[:8]}...</code>")
+        status_lines.append(f"🆔 Session ID: <code>{claude_session_id}</code>")
     elif resumable_info:
         status_lines.append(resumable_info)
         status_lines.append("💡 Session will auto-resume on your next message")
@@ -1230,6 +1231,134 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         await update.message.reply_text(f"❌ <b>Git Error</b>\n\n{str(e)}")
         logger.error("Error in git_command", error=str(e), user_id=user_id)
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /usage — show Claude subscription plan usage (5h session + weekly).
+
+    Live data from the Claude OAuth usage endpoint (same source as the
+    Claude Code CLI /usage panel). Requires a Claude subscription login on
+    the machine running the bot. Undocumented endpoint — may break if
+    Anthropic changes it.
+
+    Note: no token refresh. If the local OAuth access token has expired and
+    nothing else refreshed it, this returns a 401 error until the next
+    Claude run (the SDK refreshes the token on its own runs).
+    """
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+    success = False
+
+    try:
+        result = await fetch_plan_usage()
+        windows = result.get("windows") or {}
+        labels = {
+            "five_hour": "Current session (5h)",
+            "seven_day": "Current week (all models)",
+            "seven_day_sonnet": "Current week (Sonnet only)",
+            "seven_day_opus": "Current week (Opus only)",
+        }
+
+        lines = ["📊 <b>Usage</b>"]
+        for key in (
+            "five_hour",
+            "seven_day",
+            "seven_day_sonnet",
+            "seven_day_opus",
+        ):
+            w = windows.get(key)
+            if not w:
+                continue
+            util = w.get("utilization")
+            pct = float(util) if isinstance(util, (int, float)) else 0.0
+            filled = max(0, min(10, round(pct / 10)))
+            bar = "█" * filled + "░" * (10 - filled)
+            if pct >= 90:
+                icon = "🔴"
+            elif pct >= 75:
+                icon = "🟡"
+            else:
+                icon = "🟢"
+            line = (
+                f"\n{icon} <b>{labels.get(key, key)}</b>\n"
+                f"<code>{bar}</code> {pct:.0f}% used"
+            )
+            resets_at = w.get("resets_at")
+            if isinstance(resets_at, datetime):
+                local = resets_at.astimezone()
+                stamp = local.strftime("%b %d, %I:%M%p").replace(" 0", " ")
+                tz = local.strftime("%Z")
+                if tz:
+                    stamp += f" {tz}"
+                line += f"\nResets {stamp}"
+            lines.append(line)
+        text = "\n".join(lines)
+        success = True
+    except UsageError as exc:
+        text = f"📊 <b>Usage</b>\n\n❌ {exc}"
+    except Exception as exc:  # noqa: BLE001 - surface unexpected failures
+        logger.error("Unexpected error in usage_command", error=str(exc))
+        text = "📊 <b>Usage</b>\n\n❌ Unexpected error fetching usage."
+
+    await update.message.reply_text(text, parse_mode="HTML")
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id, command="usage", args=[], success=success
+        )
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /resume <session_id> — adopt an external Claude session.
+
+    Useful when continuing work started in cmux/terminal: copy the session ID
+    from Claude Code CLI, paste here, and subsequent Telegram messages append
+    to the same conversation transcript.
+    """
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    async def _audit(success: bool) -> None:
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="resume", args=[], success=success
+            )
+
+    args = update.message.text.split()[1:] if update.message.text else []
+    if not args:
+        await update.message.reply_text(
+            "Usage: <code>/resume &lt;session_id&gt;</code>\n\n"
+            "Adopts an existing Claude session — useful when continuing work "
+            "started in cmux/terminal. The session ID is the filename in "
+            "<code>~/.claude/projects/&lt;encoded-cwd&gt;/</code> without "
+            "the .jsonl extension.",
+            parse_mode="HTML",
+        )
+        await _audit(False)
+        return
+
+    session_id = args[0].strip()
+    if not session_id or len(session_id) < 8:
+        await update.message.reply_text("Invalid session ID (too short).")
+        await _audit(False)
+        return
+
+    old_session_id = context.user_data.get("claude_session_id")
+    context.user_data["claude_session_id"] = session_id
+
+    safe_session_id = escape_html(session_id)
+    if old_session_id:
+        msg = (
+            f"Switched session\n"
+            f"Old: <code>{escape_html(old_session_id[:8])}...</code>\n"
+            f"New: <code>{safe_session_id}</code>"
+        )
+    else:
+        msg = (
+            f"Adopted session: <code>{safe_session_id}</code>\n\n"
+            "Next message will resume this conversation."
+        )
+    await update.message.reply_text(msg, parse_mode="HTML")
+    await _audit(True)
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

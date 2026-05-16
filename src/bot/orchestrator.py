@@ -327,6 +327,8 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("resume", command.resume_command),
+            ("usage", command.usage_command),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -416,6 +418,8 @@ class MessageOrchestrator:
             ("export", command.export_session),
             ("actions", command.quick_actions),
             ("git", command.git_command),
+            ("resume", command.resume_command),
+            ("usage", command.usage_command),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -460,6 +464,8 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("usage", "Show Claude plan usage"),
+                BotCommand("resume", "Adopt an external Claude session"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -480,6 +486,8 @@ class MessageOrchestrator:
                 BotCommand("export", "Export current session"),
                 BotCommand("actions", "Show quick actions"),
                 BotCommand("git", "Git repository commands"),
+                BotCommand("usage", "Show Claude plan usage"),
+                BotCommand("resume", "Adopt an external Claude session"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -576,9 +584,10 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
-        await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
-        )
+        msg = f"📂 {dir_display} · Session: {session_status}{cost_str}"
+        if session_id:
+            msg += f"\n🆔 <code>{session_id}</code>"
+        await update.message.reply_text(msg, parse_mode="HTML")
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
