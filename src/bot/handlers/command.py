@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import signal
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1414,6 +1415,29 @@ def _bot_repo_root() -> Path:
     return here.parents[3]
 
 
+def _capture_startup_commit() -> Optional[str]:
+    """Full SHA of the code this process was started from.
+
+    Captured once at import (process start), so /version can report the
+    commit that is actually running in memory rather than whatever HEAD
+    currently is on disk (which may be ahead after a pull-before-restart).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(_bot_repo_root()), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+_STARTUP_COMMIT: Optional[str] = _capture_startup_commit()
+
+
 async def _run_git(
     repo: Path, *args: str, timeout: float = 30.0
 ) -> Tuple[int, str, str]:
@@ -1454,12 +1478,12 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     repo = _bot_repo_root()
 
-    # Single git call for hash + subject + date (0x1f field separator).
+    # Single git call: full SHA + short + subject + date (0x1f separator).
     rc, info, _ = await _run_git(
         repo,
         "log",
         "-1",
-        "--pretty=%h%x1f%s%x1f%cd",
+        "--pretty=%H%x1f%h%x1f%s%x1f%cd",
         "--date=format:%Y-%m-%d %H:%M",
     )
     if rc != 0:
@@ -1476,23 +1500,34 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     fields = info.split("\x1f")
-    head = fields[0] if len(fields) > 0 else "?"
-    subject = fields[1] if len(fields) > 1 else ""
-    cdate = fields[2] if len(fields) > 2 else ""
+    disk_full = fields[0] if len(fields) > 0 else ""
+    disk_short = fields[1] if len(fields) > 1 else "?"
+    subject = fields[2] if len(fields) > 2 else ""
+    cdate = fields[3] if len(fields) > 3 else ""
     _, branch, _ = await _run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
     _, dirty_out, _ = await _run_git(
         repo, "status", "--porcelain", "--untracked-files=no"
     )
     state = "dirty" if dirty_out else "clean"
 
+    if _STARTUP_COMMIT:
+        running = f"<code>{escape_html(_STARTUP_COMMIT[:7])}</code>"
+        stale = _STARTUP_COMMIT != disk_full
+    else:
+        running = "<i>unknown</i>"
+        stale = False
+
     msg = (
         "📦 <b>Version</b>\n\n"
-        f"Commit: <code>{escape_html(head)}</code> ({state})\n"
+        f"Running: {running} (code in memory)\n"
+        f"Disk HEAD: <code>{escape_html(disk_short)}</code> ({state})\n"
         f"Branch: <code>{escape_html(branch)}</code>\n"
         f"Subject: {escape_html(subject)}\n"
         f"Date: {escape_html(cdate)}\n"
         f"Package: <code>{escape_html(__version__)}</code>"
     )
+    if stale:
+        msg += "\n\n⚠️ Disk is ahead of running code — " "restart (or /deploy) to apply."
     await update.message.reply_text(msg, parse_mode="HTML")
     if audit_logger:
         await audit_logger.log_command(
