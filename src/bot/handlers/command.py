@@ -1,15 +1,19 @@
 """Command handlers for bot operations."""
 
+import asyncio
 import os
+import re
 import signal
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from ... import __version__
 from ...claude.facade import ClaudeIntegration
 from ...claude.usage_client import UsageError, fetch_plan_usage
 from ...config.settings import Settings
@@ -1386,6 +1390,245 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # SIGTERM triggers the existing graceful-shutdown handler in main.py;
     # systemd Restart=always will bring the process back up.
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+_CRED_URL_RE = re.compile(r"(\w+://)[^/\s:@]+(?::[^/\s@]+)?@")
+
+
+def _redact(text: str) -> str:
+    """Mask credentials embedded in URLs (scheme://user:pass@host)."""
+    return _CRED_URL_RE.sub(r"\1***@", text)
+
+
+def _bot_repo_root() -> Path:
+    """Locate the bot's own source repo root (the dir containing .git).
+
+    Walks up from this file; falls back to the package parent. This is the
+    bot's code repo, NOT the project the session is operating on.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / ".git").exists():
+            return parent
+    return here.parents[3]
+
+
+async def _run_git(
+    repo: Path, *args: str, timeout: float = 30.0
+) -> Tuple[int, str, str]:
+    """Run a git command in ``repo``; never prompt or hang for credentials."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(repo),
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except OSError as exc:
+        return (127, "", f"git not available: {exc}")
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return (124, "", "git command timed out")
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        out_b.decode("utf-8", "replace").strip(),
+        err_b.decode("utf-8", "replace").strip(),
+    )
+
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /version — show the running bot's source code revision.
+
+    Reports the git commit of the bot's own code repo (offline, no fetch)
+    so you can confirm which code the running process was started from.
+    """
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+    repo = _bot_repo_root()
+
+    rc, head, _ = await _run_git(repo, "rev-parse", "--short", "HEAD")
+    if rc != 0:
+        await update.message.reply_text(
+            "📦 <b>Version</b>\n\n"
+            f"Package: <code>{escape_html(__version__)}</code>\n"
+            "Git metadata unavailable (not a git checkout).",
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="version", args=[], success=True
+            )
+        return
+
+    _, subject, _ = await _run_git(repo, "log", "-1", "--pretty=%s")
+    _, branch, _ = await _run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    _, cdate, _ = await _run_git(
+        repo, "log", "-1", "--pretty=%cd", "--date=format:%Y-%m-%d %H:%M"
+    )
+    _, dirty_out, _ = await _run_git(
+        repo, "status", "--porcelain", "--untracked-files=no"
+    )
+    state = "dirty" if dirty_out else "clean"
+
+    msg = (
+        "📦 <b>Version</b>\n\n"
+        f"Commit: <code>{escape_html(head)}</code> ({state})\n"
+        f"Branch: <code>{escape_html(branch)}</code>\n"
+        f"Subject: {escape_html(subject)}\n"
+        f"Date: {escape_html(cdate)}\n"
+        f"Package: <code>{escape_html(__version__)}</code>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id, command="version", args=[], success=True
+        )
+
+
+async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /deploy — pull latest bot code and restart.
+
+    Fast-forward pull of the current branch from its configured upstream,
+    a byte-compile sanity gate, then a SIGTERM restart (requires a process
+    supervisor / make run-watch, same as /restart). On compile failure the
+    pull is rolled back and the bot is NOT restarted.
+    """
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+    repo = _bot_repo_root()
+
+    async def _fail(text: str) -> None:
+        await update.message.reply_text(text, parse_mode="HTML")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="deploy", args=[], success=False
+            )
+
+    rc, old_sha, err = await _run_git(repo, "rev-parse", "HEAD")
+    if rc != 0:
+        await _fail(
+            "🚀 <b>Deploy</b>\n\n❌ Not a git checkout: " f"{escape_html(_redact(err))}"
+        )
+        return
+
+    # Abort on tracked local modifications (untracked files are fine for ff).
+    _, tracked, _ = await _run_git(
+        repo, "status", "--porcelain", "--untracked-files=no"
+    )
+    if tracked:
+        await _fail(
+            "🚀 <b>Deploy</b>\n\n❌ Aborted: working tree has local "
+            "changes to tracked files. Resolve them on the host first."
+        )
+        return
+
+    await update.message.reply_text(
+        "🚀 <b>Deploy</b>\n\nPulling latest code…", parse_mode="HTML"
+    )
+
+    rc, _out, perr = await _run_git(repo, "pull", "--ff-only")
+    if rc != 0:
+        await _fail(
+            "🚀 <b>Deploy</b>\n\n❌ git pull failed (not fast-forward, "
+            f"auth, or network):\n<code>{escape_html(_redact(perr[:500]))}</code>"
+        )
+        return
+
+    _, new_full, _ = await _run_git(repo, "rev-parse", "HEAD")
+    _, new_sha, _ = await _run_git(repo, "rev-parse", "--short", "HEAD")
+    _, old_short, _ = await _run_git(repo, "rev-parse", "--short", old_sha)
+    if new_full == old_sha:
+        await update.message.reply_text(
+            "🚀 <b>Deploy</b>\n\n✅ Already up to date. No restart.",
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="deploy", args=[], success=True
+            )
+        return
+
+    # Dependency-change warning (no auto-install).
+    _, changed, _ = await _run_git(repo, "diff", "--name-only", old_sha, "HEAD")
+    dep_files = {"pyproject.toml", "poetry.lock", "uv.lock"}
+    deps_changed = any(line.strip() in dep_files for line in changed.splitlines())
+
+    # Sanity gates before restart: compileall catches syntax errors; the
+    # import smoke catches import-time errors compileall misses (bad
+    # imports, module-level failures). Importing src.main pulls the whole
+    # dependency graph without starting the bot (main() is guarded).
+    # Either failure rolls back to the previous commit and skips restart.
+    async def _sanity_gate(argv: List[str], label: str) -> bool:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(repo),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=120.0)
+            gate_rc = proc.returncode
+            gate_out = out_b.decode("utf-8", "replace").strip()
+        except (OSError, asyncio.TimeoutError) as exc:
+            gate_rc = 1
+            gate_out = f"{label} failed to run: {exc}"
+
+        if gate_rc == 0:
+            return True
+
+        reset_rc, _, _ = await _run_git(repo, "reset", "--hard", old_sha)
+        rollback = (
+            f"rolled back to <code>{escape_html(old_short)}</code>"
+            if reset_rc == 0
+            else "ROLLBACK FAILED — fix on host"
+        )
+        await _fail(
+            f"🚀 <b>Deploy</b>\n\n❌ New code failed {label} — {rollback}. "
+            "Bot NOT restarted.\n"
+            f"<code>{escape_html(_redact(gate_out[:500]))}</code>"
+        )
+        return False
+
+    if not await _sanity_gate(
+        [sys.executable, "-m", "compileall", "-q", "src"], "compile"
+    ):
+        return
+    if not await _sanity_gate(
+        [sys.executable, "-c", "import src.main"], "import smoke"
+    ):
+        return
+
+    _, subject, _ = await _run_git(repo, "log", "-1", "--pretty=%s")
+    warn = (
+        "\n⚠️ Dependency files changed — run install on the host."
+        if deps_changed
+        else ""
+    )
+    await update.message.reply_text(
+        "🚀 <b>Deploy</b>\n\n"
+        f"✅ <code>{escape_html(old_short)}</code> → "
+        f"<code>{escape_html(new_sha)}</code>\n"
+        f"{escape_html(subject)}{warn}\n\nRestarting…",
+        parse_mode="HTML",
+    )
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id, command="deploy", args=[], success=True
+        )
+    logger.info(
+        "Deploy: restarting after pull",
+        user_id=user_id,
+        old=old_short,
+        new=new_sha,
+    )
     os.kill(os.getpid(), signal.SIGTERM)
 
 

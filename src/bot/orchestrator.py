@@ -330,6 +330,8 @@ class MessageOrchestrator:
             ("review", self.agentic_review),
             ("resume", command.resume_command),
             ("usage", command.usage_command),
+            ("version", command.version_command),
+            ("deploy", command.deploy_command),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -421,6 +423,8 @@ class MessageOrchestrator:
             ("git", command.git_command),
             ("resume", command.resume_command),
             ("usage", command.usage_command),
+            ("version", command.version_command),
+            ("deploy", command.deploy_command),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -468,6 +472,8 @@ class MessageOrchestrator:
                 BotCommand("review", "Review changes (security/code/perf)"),
                 BotCommand("usage", "Show Claude plan usage"),
                 BotCommand("resume", "Adopt an external Claude session"),
+                BotCommand("version", "Show running bot code revision"),
+                BotCommand("deploy", "Pull latest bot code and restart"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -490,6 +496,8 @@ class MessageOrchestrator:
                 BotCommand("git", "Git repository commands"),
                 BotCommand("usage", "Show Claude plan usage"),
                 BotCommand("resume", "Adopt an external Claude session"),
+                BotCommand("version", "Show running bot code revision"),
+                BotCommand("deploy", "Pull latest bot code and restart"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
