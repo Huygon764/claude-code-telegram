@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format clean help run run-watch run-remote remote-attach remote-stop \
+.PHONY: install dev test lint format clean help run run-forever run-watch run-remote remote-attach remote-stop \
        bump-patch bump-minor bump-major release version
 
 # Default target
@@ -11,6 +11,7 @@ help:
 	@echo "  format        - Format code"
 	@echo "  clean         - Clean up generated files"
 	@echo "  run           - Run the bot"
+	@echo "  run-forever   - Run the bot with a self-restart supervisor"
 	@echo "  run-watch     - Run the bot with auto-restart on code changes"
 	@echo "  version       - Show current version"
 	@echo "  bump-patch    - Bump patch version (1.2.0 -> 1.2.1), commit, and tag"
@@ -50,6 +51,9 @@ clean:
 run:
 	poetry run claude-telegram-bot
 
+run-forever:  ## Run the bot with a self-restart supervisor (no systemd needed)
+	bash scripts/run-forever.sh
+
 run-watch:  ## Run the bot with auto-restart on src/ changes (uses watchfiles)
 	poetry run watchfiles "claude-telegram-bot" src/
 
@@ -60,7 +64,7 @@ run-debug:
 # Remote Mac Mini (SSH session)
 run-remote:  ## Start bot on remote Mac in tmux (persists after SSH disconnect)
 	security unlock-keychain ~/Library/Keychains/login.keychain-db
-	tmux new-session -d -s claude-bot 'poetry run claude-telegram-bot'
+	tmux new-session -d -s claude-bot 'bash scripts/run-forever.sh'
 	@echo "Bot started in tmux session 'claude-bot'"
 	@echo "  Attach: make remote-attach"
 	@echo "  Stop:   make remote-stop"
