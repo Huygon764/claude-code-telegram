@@ -1299,7 +1299,7 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text = "\n".join(lines)
         success = True
     except UsageError as exc:
-        text = f"📊 <b>Usage</b>\n\n❌ {exc}"
+        text = f"📊 <b>Usage</b>\n\n❌ {escape_html(str(exc))}"
     except Exception as exc:  # noqa: BLE001 - surface unexpected failures
         logger.error("Unexpected error in usage_command", error=str(exc))
         text = "📊 <b>Usage</b>\n\n❌ Unexpected error fetching usage."
@@ -1454,7 +1454,14 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     repo = _bot_repo_root()
 
-    rc, head, _ = await _run_git(repo, "rev-parse", "--short", "HEAD")
+    # Single git call for hash + subject + date (0x1f field separator).
+    rc, info, _ = await _run_git(
+        repo,
+        "log",
+        "-1",
+        "--pretty=%h%x1f%s%x1f%cd",
+        "--date=format:%Y-%m-%d %H:%M",
+    )
     if rc != 0:
         await update.message.reply_text(
             "📦 <b>Version</b>\n\n"
@@ -1468,11 +1475,11 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         return
 
-    _, subject, _ = await _run_git(repo, "log", "-1", "--pretty=%s")
+    fields = info.split("\x1f")
+    head = fields[0] if len(fields) > 0 else "?"
+    subject = fields[1] if len(fields) > 1 else ""
+    cdate = fields[2] if len(fields) > 2 else ""
     _, branch, _ = await _run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-    _, cdate, _ = await _run_git(
-        repo, "log", "-1", "--pretty=%cd", "--date=format:%Y-%m-%d %H:%M"
-    )
     _, dirty_out, _ = await _run_git(
         repo, "status", "--porcelain", "--untracked-files=no"
     )
