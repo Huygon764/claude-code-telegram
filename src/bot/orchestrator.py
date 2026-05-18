@@ -327,6 +327,7 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("review", self.agentic_review),
             ("resume", command.resume_command),
             ("usage", command.usage_command),
             ("restart", command.restart_command),
@@ -464,6 +465,7 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("review", "Review changes (security/code/perf)"),
                 BotCommand("usage", "Show Claude plan usage"),
                 BotCommand("resume", "Adopt an external Claude session"),
                 BotCommand("restart", "Restart the bot"),
@@ -922,11 +924,19 @@ class MessageOrchestrator:
         return caption_sent
 
     async def agentic_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        prompt_override: Optional[str] = None,
     ) -> None:
-        """Direct Claude passthrough. Simple progress. No suggestions."""
+        """Direct Claude passthrough. Simple progress. No suggestions.
+
+        ``prompt_override`` lets internal callers (e.g. /review) run Claude
+        with a constructed prompt instead of the raw user message, while
+        reusing all the streaming/session/limit plumbing.
+        """
         user_id = update.effective_user.id
-        message_text = update.message.text
+        message_text = prompt_override or update.message.text
 
         logger.info(
             "Agentic text message",
@@ -1167,6 +1177,65 @@ class MessageOrchestrator:
                 args=[message_text[:100]],
                 success=success,
             )
+
+    async def agentic_review(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """/review — security/code/performance review of current changes.
+
+        Reviews the diff of whatever project the bot session points at:
+        uncommitted changes plus commits ahead of the default branch.
+        ``/review deep`` dispatches parallel sub-agents (security, code,
+        performance) — heavier, may hit per-request caps. Read-only:
+        Claude is told not to modify files or git state.
+        """
+        user_id = update.effective_user.id
+        text = (update.message.text or "") if update.message else ""
+        parts = text.split(maxsplit=1)
+        deep = len(parts) > 1 and parts[1].strip().lower() == "deep"
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="review",
+                args=["deep"] if deep else [],
+                success=True,
+            )
+
+        base_prompt = (
+            "You are doing a READ-ONLY code review. Do NOT modify any "
+            "file, do NOT run git write commands (no add/commit/checkout/"
+            "reset), do NOT create branches. Only read and report.\n\n"
+            "Scope: review the changes in this repository consisting of "
+            "(1) uncommitted working-tree changes and (2) commits on the "
+            "current branch that are ahead of the default branch "
+            "(origin/main or main). Determine the diff yourself with git "
+            "(git status, git diff, git diff <default>...HEAD).\n\n"
+            "Review three dimensions, each under its own heading:\n"
+            "1. Security — injection, secret/credential handling, auth, "
+            "unsafe input, path traversal, SSRF.\n"
+            "2. Code quality & correctness — bugs, edge cases, error "
+            "handling, convention violations, dead code.\n"
+            "3. Performance — needless I/O, blocking calls in async, "
+            "N+1, memory, hot paths.\n\n"
+            "For each finding: severity (Critical/High/Medium/Low), "
+            "file:line, what is wrong, and a concrete fix. If a "
+            "dimension is clean, say so. End with a short overall "
+            "verdict. Be concise and specific; skip praise."
+        )
+        if deep:
+            review_prompt = (
+                base_prompt + "\n\nDispatch THREE parallel sub-agents via "
+                "the Task tool — one each for Security, Code quality & "
+                "correctness, and Performance — reviewing the same scope, "
+                "then aggregate into one structured review. If the Task "
+                "tool is unavailable, fall back to a single-pass review."
+            )
+        else:
+            review_prompt = base_prompt
+
+        await self.agentic_text(update, context, prompt_override=review_prompt)
 
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
