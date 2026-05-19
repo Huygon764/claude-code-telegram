@@ -147,3 +147,7 @@ sessions/
 backups/
 uploads/
 config/mcp.json
+config/projects.yaml
+
+# uv lock (project standardises on poetry.lock)
+uv.lock
