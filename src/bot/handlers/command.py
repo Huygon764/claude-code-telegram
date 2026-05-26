@@ -875,6 +875,7 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Get session info
     claude_session_id = context.user_data.get("claude_session_id")
+    cursor_session_id = context.user_data.get("cursor_session_id")
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
@@ -917,15 +918,19 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "",
         f"📂 Directory: <code>{relative_path}/</code>",
         f"🤖 Claude Session: {'✅ Active' if claude_session_id else '❌ None'}",
+        f"🖱️ Cursor Session: {'✅ Active' if cursor_session_id else '❌ None'}",
         usage_info.rstrip(),
         f"🕐 Last Update: {update.message.date.strftime('%H:%M:%S UTC')}",
     ]
 
     if claude_session_id:
-        status_lines.append(f"🆔 Session ID: <code>{claude_session_id}</code>")
-    elif resumable_info:
+        status_lines.append(f"🆔 Claude: <code>{claude_session_id}</code>")
+    if cursor_session_id:
+        status_lines.append(f"🆔 Cursor: <code>{cursor_session_id}</code>")
+
+    if resumable_info:
         status_lines.append(resumable_info)
-        status_lines.append("💡 Session will auto-resume on your next message")
+        status_lines.append("💡 Claude session will auto-resume on your next message")
 
     # Add action buttons
     keyboard = []

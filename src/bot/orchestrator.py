@@ -581,10 +581,23 @@ class MessageOrchestrator:
         )
         dir_display = str(current_dir)
 
-        session_id = context.user_data.get("claude_session_id")
-        session_status = "active" if session_id else "none"
+        claude_session_id = context.user_data.get("claude_session_id")
+        cursor_session_id = context.user_data.get("cursor_session_id")
 
-        # Cost info
+        # Determine session status
+        claude_active = bool(claude_session_id)
+        cursor_active = bool(cursor_session_id)
+
+        if claude_active and cursor_active:
+            session_status = "both"
+        elif claude_active:
+            session_status = "claude"
+        elif cursor_active:
+            session_status = "cursor"
+        else:
+            session_status = "none"
+
+        # Cost info (Claude-specific for now)
         cost_str = ""
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
@@ -597,8 +610,10 @@ class MessageOrchestrator:
                 pass
 
         msg = f"📂 {dir_display} · Session: {session_status}{cost_str}"
-        if session_id:
-            msg += f"\n🆔 <code>{session_id}</code>"
+        if claude_session_id:
+            msg += f"\n🆔 Claude: <code>{claude_session_id}</code>"
+        if cursor_session_id:
+            msg += f"\n🆔 Cursor: <code>{cursor_session_id}</code>"
         await update.message.reply_text(msg, parse_mode="HTML")
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
