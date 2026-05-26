@@ -4,7 +4,6 @@ import asyncio
 import os
 import re
 import signal
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +21,8 @@ from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...storage.models import SessionModel
+from ...utils.gitinfo import STARTUP_COMMIT, bot_repo_root
+from ...utils.restart_receipt import write_receipt
 from ..utils.html_format import escape_html
 
 logger = structlog.get_logger()
@@ -1377,15 +1378,27 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     handler in group 10 runs.  No per-handler check is needed.
     """
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id
 
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "🔄 <b>Restarting bot…</b>\n\nBack shortly.",
         parse_mode="HTML",
     )
 
     if audit_logger:
         await audit_logger.log_command(user_id, "restart", [], True)
+
+    # Receipt is read back on startup to edit the message above into a
+    # "back online" confirmation (this process will not survive to do it).
+    write_receipt(
+        settings,
+        chat_id=sent.chat_id,
+        message_id=sent.message_id,
+        user_id=user_id,
+        kind="restart",
+        message_thread_id=sent.message_thread_id,
+    )
 
     logger.info("Restart requested via /restart command", user_id=user_id)
 
@@ -1402,40 +1415,9 @@ def _redact(text: str) -> str:
     return _CRED_URL_RE.sub(r"\1***@", text)
 
 
-def _bot_repo_root() -> Path:
-    """Locate the bot's own source repo root (the dir containing .git).
-
-    Walks up from this file; falls back to the package parent. This is the
-    bot's code repo, NOT the project the session is operating on.
-    """
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        if (parent / ".git").exists():
-            return parent
-    return here.parents[3]
-
-
-def _capture_startup_commit() -> Optional[str]:
-    """Full SHA of the code this process was started from.
-
-    Captured once at import (process start), so /version can report the
-    commit that is actually running in memory rather than whatever HEAD
-    currently is on disk (which may be ahead after a pull-before-restart).
-    """
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(_bot_repo_root()), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.stdout.strip() if out.returncode == 0 else None
-
-
-_STARTUP_COMMIT: Optional[str] = _capture_startup_commit()
+# Git revision helpers live in src/utils/gitinfo (single source of truth,
+# shared with the startup notification). STARTUP_COMMIT is captured there
+# once at import == process start.
 
 
 async def _run_git(
@@ -1476,7 +1458,7 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
     user_id = update.effective_user.id
-    repo = _bot_repo_root()
+    repo = bot_repo_root()
 
     # Single git call: full SHA + short + subject + date (0x1f separator).
     rc, info, _ = await _run_git(
@@ -1510,9 +1492,9 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     state = "dirty" if dirty_out else "clean"
 
-    if _STARTUP_COMMIT:
-        running = f"<code>{escape_html(_STARTUP_COMMIT[:7])}</code>"
-        stale = _STARTUP_COMMIT != disk_full
+    if STARTUP_COMMIT:
+        running = f"<code>{escape_html(STARTUP_COMMIT[:7])}</code>"
+        stale = STARTUP_COMMIT != disk_full
     else:
         running = "<i>unknown</i>"
         stale = False
@@ -1544,8 +1526,9 @@ async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     pull is rolled back and the bot is NOT restarted.
     """
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id
-    repo = _bot_repo_root()
+    repo = bot_repo_root()
 
     async def _fail(text: str) -> None:
         await update.message.reply_text(text, parse_mode="HTML")
@@ -1654,7 +1637,7 @@ async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if deps_changed
         else ""
     )
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "🚀 <b>Deploy</b>\n\n"
         f"✅ <code>{escape_html(old_short)}</code> → "
         f"<code>{escape_html(new_sha)}</code>\n"
@@ -1665,6 +1648,19 @@ async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await audit_logger.log_command(
             user_id=user_id, command="deploy", args=[], success=True
         )
+
+    # Receipt is read back on startup to edit the message above into a
+    # "back online" confirmation (this process will not survive to do it).
+    write_receipt(
+        settings,
+        chat_id=sent.chat_id,
+        message_id=sent.message_id,
+        user_id=user_id,
+        kind="deploy",
+        detail=f"{old_short} -> {new_sha}",
+        message_thread_id=sent.message_thread_id,
+    )
+
     logger.info(
         "Deploy: restarting after pull",
         user_id=user_id,

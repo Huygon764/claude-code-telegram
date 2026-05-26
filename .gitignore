@@ -151,3 +151,6 @@ config/projects.yaml
 
 # uv lock (project standardises on poetry.lock)
 uv.lock
+
+# Cross-restart notification receipt (runtime state)
+.restart_receipt.json

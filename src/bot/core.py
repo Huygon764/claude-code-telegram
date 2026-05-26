@@ -21,10 +21,14 @@ from telegram.ext import (
     filters,
 )
 
+from .. import __version__
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
+from ..utils.gitinfo import running_revision
+from ..utils.restart_receipt import read_and_clear_receipt
 from .features.registry import FeatureRegistry
 from .orchestrator import MessageOrchestrator
+from .utils.html_format import escape_html
 
 logger = structlog.get_logger()
 
@@ -75,6 +79,14 @@ class ClaudeCodeBot:
         if proxy_url:
             builder.proxy(proxy_url)
             logger.info("Proxy configured", proxy=proxy_url)
+
+        # post_init runs inside Application.initialize(), after the Bot is
+        # initialized but before the updater starts — the canonical "we are
+        # online" hook. Using it (instead of hand-placed calls in start())
+        # makes the notification fire exactly once in BOTH webhook and
+        # polling modes; a raw bot.send_message before initialize() would
+        # raise "Bot was not initialized" in webhook mode.
+        builder.post_init(self._notify_started)
 
         self.app = builder.build()
 
@@ -196,6 +208,95 @@ class ClaudeCodeBot:
 
         return middleware_wrapper
 
+    async def _notify_started(self, app: Application) -> None:
+        """Notify that the bot is online (best-effort, PTB post_init hook).
+
+        Closes the observability loop after /restart and /deploy: if a
+        restart receipt is present, edit the original "Restarting…"
+        message in-place into a "back online" confirmation so the loop
+        closes exactly where the user triggered it. Otherwise (crash,
+        host-side deploy, plain boot) fall back to broadcasting to the
+        configured notification chats. Never raises — startup must not
+        depend on Telegram being reachable.
+        """
+        revision = escape_html(running_revision())
+        version = escape_html(__version__)
+
+        receipt = read_and_clear_receipt(self.settings)
+        if receipt:
+            await self._notify_from_receipt(app, receipt, revision, version)
+            return
+
+        chat_ids = self.settings.notification_chat_ids or []
+        if not chat_ids:
+            return
+        text = (
+            "✅ <b>Bot online</b>\n"
+            f"Running <code>{revision}</code>\n"
+            f"v{version}"
+        )
+        for chat_id in chat_ids:
+            try:
+                await app.bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception as exc:  # noqa: BLE001 - notify must not crash startup
+                logger.warning(
+                    "Startup notification failed",
+                    chat_id=chat_id,
+                    error=str(exc),
+                )
+
+    async def _notify_from_receipt(
+        self,
+        app: Application,
+        receipt: Dict[str, Any],
+        revision: str,
+        version: str,
+    ) -> None:
+        """Confirm "back online" to whoever triggered the restart.
+
+        Prefer editing the original "Restarting…" message in place;
+        fall back to a new message if it was deleted or is uneditable.
+        """
+        chat_id = receipt.get("chat_id")
+        message_id = receipt.get("message_id")
+        if not isinstance(chat_id, int) or not isinstance(message_id, int):
+            return
+
+        kind = receipt.get("kind") or "restart"
+        verb = "Deployed" if kind == "deploy" else "Restarted"
+        detail = receipt.get("detail")
+        body = (
+            f"✅ <b>{verb} — bot back online</b>\n"
+            f"Running <code>{revision}</code>\n"
+            f"v{version}"
+        )
+        if isinstance(detail, str) and detail:
+            body += f"\n{escape_html(detail)}"
+
+        try:
+            await app.bot.edit_message_text(
+                body,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - edit may fail; try a fresh send
+            logger.info(
+                "Restart receipt edit failed; sending new message",
+                error=str(exc),
+            )
+        # Fallback: a fresh message. Preserve the originating forum/topic
+        # thread so it does not land in the group's General topic.
+        thread_id = receipt.get("message_thread_id")
+        send_kwargs: Dict[str, Any] = {"parse_mode": "HTML"}
+        if isinstance(thread_id, int):
+            send_kwargs["message_thread_id"] = thread_id
+        try:
+            await app.bot.send_message(chat_id, body, **send_kwargs)
+        except Exception as exc:  # noqa: BLE001 - notify must not crash startup
+            logger.warning("Restart notification failed", error=str(exc))
+
     async def start(self) -> None:
         """Start the bot."""
         if self.is_running:
@@ -212,7 +313,8 @@ class ClaudeCodeBot:
             self.is_running = True
 
             if self.settings.webhook_url:
-                # Webhook mode
+                # Webhook mode (run_webhook calls initialize() -> post_init,
+                # which fires _notify_started once the bot is online).
                 await self.app.run_webhook(
                     listen="0.0.0.0",
                     port=self.settings.webhook_port,
@@ -229,6 +331,9 @@ class ClaudeCodeBot:
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
                 )
+
+                # _notify_started fires via post_init inside the
+                # app.initialize() call above (both modes).
 
                 # Keep running until manually stopped
                 while self.is_running:

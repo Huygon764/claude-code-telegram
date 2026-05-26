@@ -333,6 +333,7 @@ class MessageOrchestrator:
             ("version", command.version_command),
             ("deploy", command.deploy_command),
             ("restart", command.restart_command),
+            ("cursor", self.agentic_cursor),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -472,6 +473,7 @@ class MessageOrchestrator:
                 BotCommand("review", "Review changes (security/code/perf)"),
                 BotCommand("usage", "Show Claude plan usage"),
                 BotCommand("resume", "Adopt an external Claude session"),
+                BotCommand("cursor", "Use Cursor Agent for this request"),
                 BotCommand("version", "Show running bot code revision"),
                 BotCommand("deploy", "Pull latest bot code and restart"),
                 BotCommand("restart", "Restart the bot"),
@@ -1256,6 +1258,261 @@ class MessageOrchestrator:
             review_prompt = base_prompt
 
         await self.agentic_text(update, context, prompt_override=review_prompt)
+
+    async def agentic_cursor(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        prompt_override: Optional[str] = None,
+    ) -> None:
+        """Direct Cursor passthrough. Simple progress. No suggestions.
+
+        ``prompt_override`` lets internal callers run Cursor
+        with a constructed prompt instead of the raw user message, while
+        reusing all the streaming/session/limit plumbing.
+        """
+        user_id = update.effective_user.id
+        message_text = prompt_override or update.message.text
+
+        logger.info(
+            "Agentic cursor message",
+            user_id=user_id,
+            message_length=len(message_text),
+        )
+
+        # Rate limit check
+        rate_limiter = context.bot_data.get("rate_limiter")
+        if rate_limiter:
+            allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
+            if not allowed:
+                await update.message.reply_text(f"⏱️ {limit_message}")
+                return
+
+        chat = update.message.chat
+        await chat.send_action("typing")
+
+        verbose_level = self._get_verbose_level(context)
+
+        # Create Stop button and interrupt event
+        interrupt_event = asyncio.Event()
+        stop_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
+        )
+        progress_msg = await update.message.reply_text(
+            "Working...", reply_markup=stop_kb
+        )
+
+        # Register active request for stop callback
+        active_request = ActiveRequest(
+            user_id=user_id,
+            interrupt_event=interrupt_event,
+            progress_msg=progress_msg,
+        )
+        self._active_requests[user_id] = active_request
+
+        cursor_integration = context.bot_data.get("cursor_integration")
+        if not cursor_integration:
+            self._active_requests.pop(user_id, None)
+            await progress_msg.edit_text(
+                "Cursor integration not available. Check configuration.",
+                reply_markup=None,
+            )
+            return
+
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        session_id = context.user_data.get("cursor_session_id")  # Note: still using claude_session_id for now
+
+        # Check if /new was used — skip auto-resume for this first message.
+        # Flag is only cleared after a successful run so retries keep the intent.
+        force_new = bool(context.user_data.get("force_new_session"))
+
+        # --- Verbose progress tracking via stream callback ---
+        tool_log: List[Dict[str, Any]] = []
+        start_time = time.time()
+        mcp_images: List[ImageAttachment] = []
+
+        # Stream drafts (private chats only)
+        draft_streamer: Optional[DraftStreamer] = None
+        if self.settings.enable_stream_drafts and chat.type == "private":
+            draft_streamer = DraftStreamer(
+                bot=context.bot,
+                chat_id=chat.id,
+                draft_id=generate_draft_id(),
+                message_thread_id=update.message.message_thread_id,
+                throttle_interval=self.settings.stream_draft_interval,
+            )
+
+        on_stream = self._make_stream_callback(
+            verbose_level,
+            progress_msg,
+            tool_log,
+            start_time,
+            reply_markup=stop_kb,
+            mcp_images=mcp_images,
+            approved_directory=self.settings.approved_directory,
+            draft_streamer=draft_streamer,
+            interrupt_event=interrupt_event,
+        )
+
+        # Independent typing heartbeat — stays alive even with no stream events
+        heartbeat = self._start_typing_heartbeat(chat)
+
+        success = True
+        try:
+            cursor_response = await cursor_integration.run_command(
+                prompt=message_text,
+                working_directory=current_dir,
+                user_id=user_id,
+                session_id=session_id,
+                on_stream=on_stream,
+                force_new=force_new,
+                interrupt_event=interrupt_event,
+            )
+
+            # New session created successfully — clear the one-shot flag
+            if force_new:
+                context.user_data["force_new_session"] = False
+
+            context.user_data["cursor_session_id"] = cursor_response.session_id
+
+            # Track directory changes
+            from .handlers.message import _update_working_directory_from_claude_response
+
+            _update_working_directory_from_claude_response(
+                cursor_response, context, self.settings, user_id
+            )
+
+            # Store interaction
+            storage = context.bot_data.get("storage")
+            if storage:
+                try:
+                    await storage.save_claude_interaction(
+                        user_id=user_id,
+                        session_id=cursor_response.session_id,
+                        prompt=message_text,
+                        response=cursor_response,
+                        ip_address=None,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to log interaction", error=str(e))
+
+            # Format response (no reply_markup — strip keyboards)
+            from .utils.formatting import ResponseFormatter
+
+            formatter = ResponseFormatter(self.settings)
+
+            response_content = cursor_response.content
+            if cursor_response.interrupted:
+                response_content = (
+                    response_content or ""
+                ) + "\n\n_(Interrupted by user)_"
+
+            formatted_messages = formatter.format_claude_response(response_content)
+
+        except Exception as e:
+            success = False
+            logger.error("Cursor integration failed", error=str(e), user_id=user_id)
+            from .handlers.message import _format_error_message
+            from .utils.formatting import FormattedMessage
+
+            formatted_messages = [
+                FormattedMessage(_format_error_message(e), parse_mode="HTML")
+            ]
+        finally:
+            heartbeat.cancel()
+            self._active_requests.pop(user_id, None)
+            if draft_streamer:
+                try:
+                    await draft_streamer.flush()
+                except Exception:
+                    logger.debug("Draft flush failed in finally block", user_id=user_id)
+
+        try:
+            await progress_msg.delete()
+        except Exception:
+            logger.debug("Failed to delete progress message, ignoring")
+
+        # Use MCP-collected images (from send_image_to_user tool calls)
+        images: List[ImageAttachment] = mcp_images
+
+        # Try to combine text + images in one message when possible
+        caption_sent = False
+        if images and len(formatted_messages) == 1:
+            msg = formatted_messages[0]
+            if msg.text and len(msg.text) <= 1024:
+                try:
+                    caption_sent = await self._send_images(
+                        update,
+                        images,
+                        reply_to_message_id=update.message.message_id,
+                        caption=msg.text,
+                        caption_parse_mode=msg.parse_mode,
+                    )
+                except Exception as img_err:
+                    logger.warning("Image+caption send failed", error=str(img_err))
+
+        # Send text messages (skip if caption was already embedded in photos)
+        if not caption_sent:
+            for i, message in enumerate(formatted_messages):
+                if not message.text or not message.text.strip():
+                    continue
+                try:
+                    await update.message.reply_text(
+                        message.text,
+                        parse_mode=message.parse_mode,
+                        reply_markup=None,  # No keyboards in agentic mode
+                        reply_to_message_id=(
+                            update.message.message_id if i == 0 else None
+                        ),
+                    )
+                    if i < len(formatted_messages) - 1:
+                        await asyncio.sleep(0.5)
+                except Exception as send_err:
+                    logger.warning(
+                        "Failed to send HTML response, retrying as plain text",
+                        error=str(send_err),
+                        message_index=i,
+                    )
+                    try:
+                        await update.message.reply_text(
+                            message.text,
+                            reply_markup=None,
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
+                    except Exception as plain_err:
+                        await update.message.reply_text(
+                            f"Failed to deliver response "
+                            f"(Telegram error: {str(plain_err)[:150]}). "
+                            f"Please try again.",
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
+
+            # Send images separately if caption wasn't used
+            if images:
+                try:
+                    await self._send_images(
+                        update,
+                        images,
+                        reply_to_message_id=update.message.message_id,
+                    )
+                except Exception as img_err:
+                    logger.warning("Image send failed", error=str(img_err))
+
+        # Audit log
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="cursor",
+                args=[message_text[:100]],
+                success=success,
+            )
 
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

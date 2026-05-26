@@ -17,6 +17,16 @@ from src.claude import (
     SessionManager,
 )
 from src.claude.sdk_integration import ClaudeSDKManager
+from src.cursor import (
+    CursorIntegration,
+    CursorSessionManager,
+)
+from src.cursor.cli_integration import CursorAgentManager
+from src.cursor import (
+    CursorIntegration,
+    CursorSessionManager,
+)
+from src.cursor.cli_integration import CursorAgentManager
 from src.config.features import FeatureFlags
 from src.config.settings import Settings
 from src.events.bus import EventBus
@@ -137,17 +147,31 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     audit_logger = AuditLogger(audit_storage)
 
     # Create Claude integration components with persistent storage
-    session_storage = SQLiteSessionStorage(storage.db_manager)
-    session_manager = SessionManager(config, session_storage)
+    claude_session_storage = SQLiteSessionStorage(storage.db_manager)
+    claude_session_manager = SessionManager(config, claude_session_storage)
 
     # Create Claude SDK manager and integration facade
     logger.info("Using Claude Python SDK integration")
-    sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
+    claude_sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
 
     claude_integration = ClaudeIntegration(
         config=config,
-        sdk_manager=sdk_manager,
-        session_manager=session_manager,
+        sdk_manager=claude_sdk_manager,
+        session_manager=claude_session_manager,
+    )
+
+    # Create Cursor integration components with separate session storage
+    cursor_session_storage = SQLiteSessionStorage(storage.db_manager)
+    cursor_session_manager = SessionManager(config, cursor_session_storage)
+
+    # Create Cursor CLI manager and integration facade
+    logger.info("Using Cursor Agent CLI integration")
+    cursor_cli_manager = CursorAgentManager(config, security_validator=security_validator)
+
+    cursor_integration = CursorIntegration(
+        config=config,
+        cursor_manager=cursor_cli_manager,
+        session_manager=cursor_session_manager,
     )
 
     # --- Event bus and agentic platform components ---
@@ -177,6 +201,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "rate_limiter": rate_limiter,
         "audit_logger": audit_logger,
         "claude_integration": claude_integration,
+        "cursor_integration": cursor_integration,
         "storage": storage,
         "event_bus": event_bus,
         "project_registry": None,

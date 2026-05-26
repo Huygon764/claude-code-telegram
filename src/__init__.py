@@ -5,7 +5,14 @@ to interact with their projects from anywhere through a secure, terminal-like
 interface within Telegram.
 """
 
-import tomllib
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        # Fallback for very old Python versions without tomli
+        tomllib = None
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
