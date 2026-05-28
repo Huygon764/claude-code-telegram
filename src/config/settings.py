@@ -207,50 +207,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Cursor settings
-    cursor_cli_path: Optional[str] = Field(
-        None, description="Path to Cursor CLI executable"
-    )
-    cursor_model: Optional[str] = Field(
-        None, description="Cursor model to use (defaults to CLI default if unset)"
-    )
-    cursor_max_turns: int = Field(
-        DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns for Cursor"
-    )
-    cursor_timeout_seconds: int = Field(
-        DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Cursor timeout"
-    )
-    cursor_max_cost_per_request: float = Field(
-        DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
-        description="Max cost per individual request for Cursor (informational)",
-    )
-    cursor_retry_max_attempts: int = Field(
-        DEFAULT_RETRY_MAX_ATTEMPTS,
-        ge=0,
-        description="Max retry attempts for transient Cursor errors (0 = disabled)",
-    )
-    cursor_retry_base_delay: float = Field(
-        DEFAULT_RETRY_BASE_DELAY,
-        ge=0,
-        description=(
-            "Base delay in seconds between retries. "
-            "0 means retries are attempted immediately with no pause."
-        ),
-    )
-    cursor_retry_backoff_factor: float = Field(
-        DEFAULT_RETRY_BACKOFF_FACTOR,
-        gt=0,
-        description="Exponential backoff multiplier",
-    )
-    cursor_retry_max_delay: float = Field(
-        DEFAULT_RETRY_MAX_DELAY,
-        ge=0,
-        description=(
-            "Maximum delay cap in seconds. "
-            "0 disables the cap entirely (delays grow unbounded with backoff)."
-        ),
-    )
-
     # Rate limiting
     rate_limit_requests: int = Field(
         DEFAULT_RATE_LIMIT_REQUESTS, description="Requests per window"

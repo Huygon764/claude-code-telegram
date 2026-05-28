@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import structlog
 
+from src.claude.sdk_integration import ClaudeResponse
 from src.config.settings import Settings
 from src.cursor.cli_integration import CursorAgentManager
 from src.cursor.session import SessionManager
@@ -78,7 +79,7 @@ class CursorIntegration:
             is_new = getattr(session, "is_new_session", False)
             should_continue = not is_new and bool(session.session_id)
 
-            # For new sessions, don't pass session_id to Cursor Code
+            # For new sessions, don't pass session_id to Cursor Agent
             cursor_session_id = session.session_id if should_continue else None
 
             try:

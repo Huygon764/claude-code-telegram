@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import structlog
 from telegram import (
@@ -39,6 +39,9 @@ from .utils.image_extractor import (
     should_send_as_photo,
     validate_image_path,
 )
+
+if TYPE_CHECKING:
+    from .utils.formatting import FormattedMessage
 
 logger = structlog.get_logger()
 
@@ -334,6 +337,7 @@ class MessageOrchestrator:
             ("deploy", command.deploy_command),
             ("restart", command.restart_command),
             ("cursor", self.agentic_cursor),
+            ("backend", self.agentic_backend),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -474,6 +478,7 @@ class MessageOrchestrator:
                 BotCommand("usage", "Show Claude plan usage"),
                 BotCommand("resume", "Adopt an external Claude session"),
                 BotCommand("cursor", "Use Cursor Agent for this request"),
+                BotCommand("backend", "Switch default backend (claude/cursor)"),
                 BotCommand("version", "Show running bot code revision"),
                 BotCommand("deploy", "Pull latest bot code and restart"),
                 BotCommand("restart", "Restart the bot"),
@@ -567,6 +572,8 @@ class MessageOrchestrator:
     ) -> None:
         """Reset session, one-line confirmation."""
         context.user_data["claude_session_id"] = None
+        context.user_data["cursor_session_id"] = None
+        context.user_data["preferred_backend"] = "claude"
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
 
@@ -584,19 +591,6 @@ class MessageOrchestrator:
         claude_session_id = context.user_data.get("claude_session_id")
         cursor_session_id = context.user_data.get("cursor_session_id")
 
-        # Determine session status
-        claude_active = bool(claude_session_id)
-        cursor_active = bool(cursor_session_id)
-
-        if claude_active and cursor_active:
-            session_status = "both"
-        elif claude_active:
-            session_status = "claude"
-        elif cursor_active:
-            session_status = "cursor"
-        else:
-            session_status = "none"
-
         # Cost info (Claude-specific for now)
         cost_str = ""
         rate_limiter = context.bot_data.get("rate_limiter")
@@ -609,12 +603,37 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
-        msg = f"📂 {dir_display} · Session: {session_status}{cost_str}"
+        backend = self._get_preferred_backend(context)
+        msg = f"📂 {dir_display} · Backend: {backend}{cost_str}"
         if claude_session_id:
             msg += f"\n🆔 Claude: <code>{claude_session_id}</code>"
         if cursor_session_id:
             msg += f"\n🆔 Cursor: <code>{cursor_session_id}</code>"
+        if not claude_session_id and not cursor_session_id:
+            msg += "\nNo active sessions"
         await update.message.reply_text(msg, parse_mode="HTML")
+
+    def _get_preferred_backend(self, context: ContextTypes.DEFAULT_TYPE) -> str:
+        """Return per-user preferred backend: ``'claude'`` (default) or ``'cursor'``."""
+        return str(context.user_data.get("preferred_backend") or "claude")
+
+    @staticmethod
+    def _prepend_agent_header(
+        formatted_messages: List["FormattedMessage"], backend: str
+    ) -> None:
+        """Prefix the first message with a compact ``🤖 <backend>`` header.
+
+        Lets the user see which agent answered when switching backends.
+        Mutates the first message in place; no-op on an empty list.
+        """
+        if not formatted_messages:
+            return
+        first = formatted_messages[0]
+        if first.parse_mode == "HTML":
+            header = f"<b>🤖 {backend}</b>\n\n"
+        else:
+            header = f"🤖 {backend}\n\n"
+        first.text = header + (first.text or "")
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -655,6 +674,35 @@ class MessageOrchestrator:
         labels = {0: "quiet", 1: "normal", 2: "detailed"}
         await update.message.reply_text(
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
+            parse_mode="HTML",
+        )
+
+    async def agentic_backend(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Switch default backend: /backend [claude|cursor]."""
+        args = update.message.text.split()[1:] if update.message.text else []
+        if not args:
+            current = self._get_preferred_backend(context)
+            await update.message.reply_text(
+                f"Backend: <b>{current}</b>\n\n"
+                "Usage: <code>/backend claude|cursor</code>\n"
+                "Text messages route to the chosen backend.\n"
+                "<code>/cursor</code> always sends to Cursor regardless.",
+                parse_mode="HTML",
+            )
+            return
+
+        choice = args[0].lower().strip()
+        if choice not in ("claude", "cursor"):
+            await update.message.reply_text(
+                "Please use: /backend claude or /backend cursor"
+            )
+            return
+
+        context.user_data["preferred_backend"] = choice
+        await update.message.reply_text(
+            f"Backend set to <b>{choice}</b>",
             parse_mode="HTML",
         )
 
@@ -827,14 +875,14 @@ class MessageOrchestrator:
                 if text:
                     first_line = text.split("\n", 1)[0].strip()
                     if first_line:
+                        # Strip markdown formatting for progress display
+                        # (progress_msg uses no parse_mode, so raw **bold**
+                        # or __italic__ would show literally).
+                        snippet = re.sub(r"[*_~`#>]+", "", first_line)[:120]
                         if verbose_level >= 1:
-                            tool_log.append(
-                                {"kind": "text", "detail": first_line[:120]}
-                            )
+                            tool_log.append({"kind": "text", "detail": snippet})
                         if draft_streamer:
-                            await draft_streamer.append_tool(
-                                f"\U0001f4ac {first_line[:120]}"
-                            )
+                            await draft_streamer.append_tool(f"\U0001f4ac {snippet}")
 
             # Stream text to user via draft (prefer token deltas;
             # skip full assistant messages to avoid double-appending)
@@ -959,7 +1007,17 @@ class MessageOrchestrator:
         ``prompt_override`` lets internal callers (e.g. /review) run Claude
         with a constructed prompt instead of the raw user message, while
         reusing all the streaming/session/limit plumbing.
+
+        If the user's preferred backend is ``"cursor"``, delegates to
+        :meth:`agentic_cursor` instead (unless ``prompt_override`` is set,
+        which means an internal caller like /review explicitly wants Claude).
         """
+        # Route to cursor backend when preferred (skip for internal callers)
+        if prompt_override is None and self._get_preferred_backend(context) == "cursor":
+            return await self.agentic_cursor(
+                update, context, prompt_override=update.message.text
+            )
+
         user_id = update.effective_user.id
         message_text = prompt_override or update.message.text
 
@@ -1099,6 +1157,7 @@ class MessageOrchestrator:
                 ) + "\n\n_(Interrupted by user)_"
 
             formatted_messages = formatter.format_claude_response(response_content)
+            self._prepend_agent_header(formatted_messages, "claude")
 
         except Exception as e:
             success = False
@@ -1121,7 +1180,12 @@ class MessageOrchestrator:
         try:
             await progress_msg.delete()
         except Exception:
-            logger.debug("Failed to delete progress message, ignoring")
+            # Delete failed — remove stale verbose content and stop button
+            # so it doesn't look like the final response.
+            try:
+                await progress_msg.edit_text("...", reply_markup=None)
+            except Exception:
+                pass
 
         # Use MCP-collected images (from send_image_to_user tool calls)
         images: List[ImageAttachment] = mcp_images
@@ -1287,7 +1351,19 @@ class MessageOrchestrator:
         reusing all the streaming/session/limit plumbing.
         """
         user_id = update.effective_user.id
-        message_text = prompt_override or update.message.text
+
+        if prompt_override is not None:
+            message_text = prompt_override
+        else:
+            # Strip the "/cursor" (or "/cursor@botname") command prefix.
+            # Without this, the literal slash command would be sent to
+            # cursor-agent as part of the prompt.
+            raw = update.message.text or ""
+            parts = raw.split(None, 1)
+            message_text = parts[1] if len(parts) > 1 else ""
+            if not message_text.strip():
+                await update.message.reply_text("Usage: /cursor <your prompt>")
+                return
 
         logger.info(
             "Agentic cursor message",
@@ -1337,7 +1413,7 @@ class MessageOrchestrator:
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("cursor_session_id")  # Note: still using claude_session_id for now
+        session_id = context.user_data.get("cursor_session_id")
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
@@ -1375,66 +1451,107 @@ class MessageOrchestrator:
         heartbeat = self._start_typing_heartbeat(chat)
 
         success = True
-        try:
-            cursor_response = await cursor_integration.run_command(
-                prompt=message_text,
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
-                force_new=force_new,
-                interrupt_event=interrupt_event,
-            )
+        cursor_response = None
+        try:  # outer try for the finally block (heartbeat/cleanup)
+            try:
+                cursor_response = await cursor_integration.run_command(
+                    prompt=message_text,
+                    working_directory=current_dir,
+                    user_id=user_id,
+                    session_id=session_id,
+                    on_stream=on_stream,
+                    force_new=force_new,
+                    interrupt_event=interrupt_event,
+                )
+            except Exception as e:
+                success = False
+                logger.error(
+                    "Cursor integration failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    user_id=user_id,
+                )
 
-            # New session created successfully — clear the one-shot flag
-            if force_new:
-                context.user_data["force_new_session"] = False
+            # Always capture session_id if we got a response (even partial)
+            if cursor_response is not None and cursor_response.session_id:
+                context.user_data["cursor_session_id"] = cursor_response.session_id
+                if force_new:
+                    context.user_data["force_new_session"] = False
 
-            context.user_data["cursor_session_id"] = cursor_response.session_id
-
-            # Track directory changes
-            from .handlers.message import _update_working_directory_from_claude_response
-
-            _update_working_directory_from_claude_response(
-                cursor_response, context, self.settings, user_id
-            )
-
-            # Store interaction
-            storage = context.bot_data.get("storage")
-            if storage:
+            # Build formatted messages
+            if success and cursor_response is not None:
                 try:
-                    await storage.save_claude_interaction(
-                        user_id=user_id,
-                        session_id=cursor_response.session_id,
-                        prompt=message_text,
-                        response=cursor_response,
-                        ip_address=None,
+                    # Track directory changes
+                    from .handlers.message import (
+                        _update_working_directory_from_claude_response,
                     )
-                except Exception as e:
-                    logger.warning("Failed to log interaction", error=str(e))
 
-            # Format response (no reply_markup — strip keyboards)
-            from .utils.formatting import ResponseFormatter
+                    _update_working_directory_from_claude_response(
+                        cursor_response, context, self.settings, user_id
+                    )
 
-            formatter = ResponseFormatter(self.settings)
+                    # Store interaction
+                    storage = context.bot_data.get("storage")
+                    if storage:
+                        try:
+                            await storage.save_claude_interaction(
+                                user_id=user_id,
+                                session_id=cursor_response.session_id,
+                                prompt=message_text,
+                                response=cursor_response,
+                                ip_address=None,
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to log interaction", error=str(e))
 
-            response_content = cursor_response.content
-            if cursor_response.interrupted:
-                response_content = (
-                    response_content or ""
-                ) + "\n\n_(Interrupted by user)_"
+                    # Format response (no reply_markup -- strip keyboards)
+                    from .utils.formatting import ResponseFormatter
 
-            formatted_messages = formatter.format_claude_response(response_content)
+                    formatter = ResponseFormatter(self.settings)
 
-        except Exception as e:
-            success = False
-            logger.error("Cursor integration failed", error=str(e), user_id=user_id)
-            from .handlers.message import _format_error_message
-            from .utils.formatting import FormattedMessage
+                    response_content = cursor_response.content
+                    if cursor_response.interrupted:
+                        response_content = (
+                            response_content or ""
+                        ) + "\n\n_(Interrupted by user)_"
 
-            formatted_messages = [
-                FormattedMessage(_format_error_message(e), parse_mode="HTML")
-            ]
+                    formatted_messages = formatter.format_claude_response(
+                        response_content
+                    )
+                    self._prepend_agent_header(formatted_messages, "cursor")
+                except Exception as fmt_err:
+                    success = False
+                    logger.error(
+                        "Cursor response formatting failed",
+                        error=str(fmt_err),
+                        user_id=user_id,
+                    )
+                    from .handlers.message import _format_error_message
+                    from .utils.formatting import FormattedMessage
+
+                    formatted_messages = [
+                        FormattedMessage(
+                            _format_error_message(fmt_err), parse_mode="HTML"
+                        )
+                    ]
+            else:
+                from .handlers.message import _format_error_message
+                from .utils.formatting import FormattedMessage
+
+                error_msg = "Cursor Agent returned no response."
+                formatted_messages = [
+                    FormattedMessage(
+                        _format_error_message(error_msg), parse_mode="HTML"
+                    )
+                ]
+        except Exception as outer_err:
+            logger.error(
+                "Cursor outer try block unhandled exception",
+                error=str(outer_err),
+                error_type=type(outer_err).__name__,
+                user_id=user_id,
+            )
+            raise
         finally:
             heartbeat.cancel()
             self._active_requests.pop(user_id, None)
@@ -1444,10 +1561,27 @@ class MessageOrchestrator:
                 except Exception:
                     logger.debug("Draft flush failed in finally block", user_id=user_id)
 
+        logger.info("Cursor: about to delete progress_msg", user_id=user_id)
         try:
             await progress_msg.delete()
-        except Exception:
-            logger.debug("Failed to delete progress message, ignoring")
+        except Exception as del_err:
+            logger.warning(
+                "Cursor progress_msg.delete() failed",
+                error=str(del_err),
+                error_type=type(del_err).__name__,
+                user_id=user_id,
+            )
+            # Delete failed — remove stale verbose content and stop button
+            # so it doesn't look like the final response.
+            try:
+                await progress_msg.edit_text("...", reply_markup=None)
+            except Exception as edit_err:
+                logger.warning(
+                    "Cursor progress_msg.edit_text fallback also failed",
+                    error=str(edit_err),
+                    error_type=type(edit_err).__name__,
+                    user_id=user_id,
+                )
 
         # Use MCP-collected images (from send_image_to_user tool calls)
         images: List[ImageAttachment] = mcp_images

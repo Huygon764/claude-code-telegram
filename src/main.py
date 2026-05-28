@@ -17,18 +17,10 @@ from src.claude import (
     SessionManager,
 )
 from src.claude.sdk_integration import ClaudeSDKManager
-from src.cursor import (
-    CursorIntegration,
-    CursorSessionManager,
-)
-from src.cursor.cli_integration import CursorAgentManager
-from src.cursor import (
-    CursorIntegration,
-    CursorSessionManager,
-)
-from src.cursor.cli_integration import CursorAgentManager
 from src.config.features import FeatureFlags
 from src.config.settings import Settings
+from src.cursor import CursorIntegration
+from src.cursor.cli_integration import CursorAgentManager
 from src.events.bus import EventBus
 from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
@@ -160,13 +152,20 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         session_manager=claude_session_manager,
     )
 
-    # Create Cursor integration components with separate session storage
-    cursor_session_storage = SQLiteSessionStorage(storage.db_manager)
+    # Create Cursor integration components with separate session storage.
+    # Cursor uses its own SQLite table so resumable-session lookup does not
+    # accidentally pick up a Claude session UUID (and vice versa).
+    cursor_session_storage = SQLiteSessionStorage(
+        storage.db_manager, table_name="cursor_sessions"
+    )
+    await cursor_session_storage.ensure_table()
     cursor_session_manager = SessionManager(config, cursor_session_storage)
 
     # Create Cursor CLI manager and integration facade
     logger.info("Using Cursor Agent CLI integration")
-    cursor_cli_manager = CursorAgentManager(config, security_validator=security_validator)
+    cursor_cli_manager = CursorAgentManager(
+        config, security_validator=security_validator
+    )
 
     cursor_integration = CursorIntegration(
         config=config,

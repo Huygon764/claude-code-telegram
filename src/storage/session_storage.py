@@ -16,12 +16,52 @@ from .models import SessionModel
 logger = structlog.get_logger()
 
 
+_VALID_TABLE_NAMES = {"sessions", "cursor_sessions"}
+
+
 class SQLiteSessionStorage(SessionStorage):
     """SQLite-based session storage."""
 
-    def __init__(self, db_manager: DatabaseManager):
-        """Initialize with database manager."""
+    def __init__(self, db_manager: DatabaseManager, table_name: str = "sessions"):
+        """Initialize with database manager and target table name.
+
+        ``table_name`` lets different backends (Claude, Cursor) keep their
+        sessions in separate tables so resumable-session lookup doesn't
+        accidentally pick up another backend's UUID.
+        """
+        if table_name not in _VALID_TABLE_NAMES:
+            raise ValueError(
+                f"Invalid session table name: {table_name!r}. "
+                f"Allowed: {sorted(_VALID_TABLE_NAMES)}"
+            )
         self.db_manager = db_manager
+        self.table_name = table_name
+
+    async def ensure_table(self) -> None:
+        """Create the backing table if it doesn't exist.
+
+        Idempotent. The schema mirrors the canonical ``sessions`` table
+        defined in ``database.py`` but without the FOREIGN KEY constraint
+        on ``user_id`` so the secondary table can live alongside the
+        primary one without ordering issues during init.
+        """
+        async with self.db_manager.get_connection() as conn:
+            await conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table_name} (
+                    session_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    project_path TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_cost REAL DEFAULT 0.0,
+                    total_turns INTEGER DEFAULT 0,
+                    message_count INTEGER DEFAULT 0,
+                    is_active BOOLEAN DEFAULT TRUE
+                )
+                """
+            )
+            await conn.commit()
 
     async def _ensure_user_exists(
         self, user_id: int, username: Optional[str] = None
@@ -78,8 +118,8 @@ class SQLiteSessionStorage(SessionStorage):
         async with self.db_manager.get_connection() as conn:
             # Try to update first
             cursor = await conn.execute(
-                """
-                UPDATE sessions
+                f"""
+                UPDATE {self.table_name}
                 SET last_used = ?, total_cost = ?, total_turns = ?, message_count = ?
                 WHERE session_id = ?
             """,
@@ -95,8 +135,8 @@ class SQLiteSessionStorage(SessionStorage):
             # If no rows were updated, insert new record
             if cursor.rowcount == 0:
                 await conn.execute(
-                    """
-                    INSERT INTO sessions
+                    f"""
+                    INSERT INTO {self.table_name}
                     (session_id, user_id, project_path, created_at, last_used,
                      total_cost, total_turns, message_count)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -127,7 +167,7 @@ class SQLiteSessionStorage(SessionStorage):
         """Load session from database, filtered by user ownership."""
         async with self.db_manager.get_connection() as conn:
             cursor = await conn.execute(
-                "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
+                f"SELECT * FROM {self.table_name} WHERE session_id = ? AND user_id = ?",
                 (session_id, user_id),
             )
             row = await cursor.fetchone()
@@ -162,7 +202,7 @@ class SQLiteSessionStorage(SessionStorage):
         """Delete session from database."""
         async with self.db_manager.get_connection() as conn:
             await conn.execute(
-                "UPDATE sessions SET is_active = FALSE WHERE session_id = ?",
+                f"UPDATE {self.table_name} SET is_active = FALSE WHERE session_id = ?",
                 (session_id,),
             )
             await conn.commit()
@@ -173,8 +213,8 @@ class SQLiteSessionStorage(SessionStorage):
         """Get all active sessions for a user."""
         async with self.db_manager.get_connection() as conn:
             cursor = await conn.execute(
-                """
-                SELECT * FROM sessions
+                f"""
+                SELECT * FROM {self.table_name}
                 WHERE user_id = ? AND is_active = TRUE
                 ORDER BY last_used DESC
             """,
@@ -204,7 +244,7 @@ class SQLiteSessionStorage(SessionStorage):
         """Get all active sessions."""
         async with self.db_manager.get_connection() as conn:
             cursor = await conn.execute(
-                "SELECT * FROM sessions WHERE is_active = TRUE ORDER BY last_used DESC"
+                f"SELECT * FROM {self.table_name} WHERE is_active = TRUE ORDER BY last_used DESC"
             )
             rows = await cursor.fetchall()
 

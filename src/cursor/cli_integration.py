@@ -3,26 +3,57 @@
 import asyncio
 import json
 import os
-from dataclasses import dataclass, field
+import signal
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import structlog
 
-from src.config.settings import Settings
-from src.security.validators import SecurityValidator
-from src.claude.sdk_integration import ClaudeResponse, StreamUpdate
 from src.claude.exceptions import (
     ClaudeMCPError,
-    ClaudeParsingError,
     ClaudeProcessError,
     ClaudeTimeoutError,
 )
+from src.claude.sdk_integration import ClaudeResponse, StreamUpdate
+from src.config.settings import Settings
+from src.security.validators import SecurityValidator
 
 logger = structlog.get_logger()
 
 # Fallback message when Cursor produces no text but did use tools.
 TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
+
+
+def _extract_cursor_tool_name(tool_call: Dict[str, Any]) -> str:
+    """Derive a tool name from a cursor-agent ``tool_call`` payload.
+
+    cursor-agent encodes the tool as the key, e.g. ``{"readToolCall": {...}}``
+    or ``{"editToolCall": {...}}``. Strip the ``ToolCall`` suffix to get a
+    short, stable name (``read``, ``edit``, ...).
+    """
+    for key in tool_call.keys():
+        if key.endswith("ToolCall"):
+            return key[: -len("ToolCall")] or "unknown"
+    return "unknown"
+
+
+def _extract_cursor_message_text(message: Dict[str, Any]) -> str:
+    """Pull text content out of a cursor-agent assistant/user message.
+
+    Schema (verified against ``cursor-agent --output-format stream-json``):
+        {"type":"assistant","message":{"role":"assistant",
+          "content":[{"type":"text","text":"..."}]}, ...}
+    """
+    msg = message.get("message") or {}
+    content = msg.get("content") or []
+    parts: List[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text") or ""
+                if text:
+                    parts.append(text)
+    return "".join(parts)
 
 
 class CursorAgentManager:
@@ -40,6 +71,50 @@ class CursorAgentManager:
         # Set up environment for Cursor CLI if needed
         # Cursor uses its own authentication system (cursor-agent login)
         logger.info("Cursor Agent Manager initialized")
+
+    async def _terminate_process_tree(
+        self, process: asyncio.subprocess.Process
+    ) -> None:
+        """Kill cursor-agent and any child processes it spawned.
+
+        cursor-agent forks children that ignore SIGTERM sent to the parent,
+        and ``process.wait()`` will hang until the pipes drain. We send the
+        signal to the whole process group, then bound the wait so this can
+        never block forever.
+        """
+        if process.returncode is not None:
+            return
+
+        pid = process.pid
+
+        def _signal_group(sig: int) -> None:
+            try:
+                os.killpg(os.getpgid(pid), sig)
+            except (ProcessLookupError, PermissionError):
+                # Fall back to single-process signal
+                try:
+                    if sig == signal.SIGTERM:
+                        process.terminate()
+                    else:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+
+        _signal_group(signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3)
+            return
+        except asyncio.TimeoutError:
+            logger.warning("SIGTERM timed out, sending SIGKILL", pid=pid)
+
+        _signal_group(signal.SIGKILL)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Cursor process did not exit after SIGKILL; abandoning wait",
+                pid=pid,
+            )
 
     def _is_retryable_error(self, exc: BaseException) -> bool:
         """Return True for transient errors that warrant a retry."""
@@ -68,80 +143,102 @@ class CursorAgentManager:
         )
 
         try:
-            # Build Cursor Agent command
-            cmd = ["cursor-agent"]
+            # Build Cursor Agent command.
+            # Note: working_directory is set via subprocess ``cwd=`` below — the
+            # CLI does not accept a ``--cwd`` flag (it errors out). We also pass
+            # ``--trust`` so headless mode doesn't block on workspace approval.
+            cmd = [
+                "cursor-agent",
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--trust",
+            ]
 
-            # Add headless/non-interactive flags
-            cmd.append("--print")  # Non-interactive mode
-
-            # Add output format for streaming
-            cmd.extend(["--output-format", "stream-json"])
-
-            # Add working directory
-            cmd.extend(["--cwd", str(working_directory)])
+            # Optional model override
+            model = self.config.cursor_model
+            if model:
+                cmd.extend(["--model", str(model)])
 
             # Handle session resumption
             if session_id and continue_session:
-                # For Cursor, we assume session_id is the chatID to resume
+                # session_id is the chatId returned in a previous ``result`` event
                 cmd.extend(["--resume", session_id])
                 logger.info("Resuming previous Cursor session", session_id=session_id)
 
-            # Add the prompt
+            # Prompt must be the last positional argument
             cmd.append(prompt)
 
-            # Prepare environment
+            # Prepare environment (Cursor CLI typically reuses login state)
             env = os.environ.copy()
-            # Cursor CLI might need specific env vars, but typically uses login state
 
-            # Execute the command
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(working_directory),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                limit=1024 * 1024,  # 1MB limit
-            )
+            if images:
+                # cursor-agent CLI has no documented image attachment mechanism;
+                # surface this clearly rather than silently dropping the input.
+                logger.warning(
+                    "Image inputs are not supported by cursor-agent CLI; ignoring",
+                    image_count=len(images),
+                )
 
-            # Collect messages and handle streaming
+            # Shared mutable state — reset at the start of each retry attempt
             messages: List[Dict[str, Any]] = []
-            interrupted = False
             tools_used: List[Dict[str, Any]] = []
+            interrupted = False
             cursor_session_id = session_id or ""
-            result_content = None
+            result_content: Optional[str] = None
             cost = 0.0
+            process: Optional[asyncio.subprocess.Process] = None
 
-            async def _read_stdout():
+            got_result = False
+
+            async def _read_stdout(proc: asyncio.subprocess.Process) -> None:
                 """Read and parse stdout line by line (stderr merged into stdout)."""
-                assert process.stdout is not None
+                nonlocal got_result
+                assert proc.stdout is not None
                 while True:
-                    line = await process.stdout.readline()
+                    line = await proc.stdout.readline()
                     if not line:
                         break
+                    line_str = ""
                     try:
-                        line_str = line.decode("utf-8").rstrip("\n\r")
-                        if line_str:
-                            # Parse stream-json line
-                            event = json.loads(line_str)
-                            messages.append(event)
+                        line_str = line.decode("utf-8", errors="replace").rstrip("\n\r")
+                        if not line_str:
+                            continue
+                        event = json.loads(line_str)
+                        messages.append(event)
 
-                            # Handle streaming callback
-                            if stream_callback:
-                                try:
-                                    await self._handle_cursor_stream_event(
-                                        event, stream_callback, tools_used
-                                    )
-                                except Exception as callback_error:
-                                    logger.warning(
-                                        "Stream callback failed",
-                                        error=str(callback_error),
-                                        error_type=type(callback_error).__name__,
-                                    )
-                    except json.JSONDecodeError as e:
                         logger.debug(
-                            "Skipping non-JSON line from Cursor output",
-                            line=line_str[:100],
-                            error=str(e),
+                            "Cursor raw event",
+                            event_type=event.get("type"),
+                            subtype=event.get("subtype"),
+                        )
+
+                        # Break BEFORE invoking stream_callback for the result
+                        # event. The callback may do slow Telegram edits, and
+                        # the orchestrator will display the final answer
+                        # anyway — we don't need to push the result through
+                        # the progress-message stream.
+                        if event.get("type") == "result":
+                            got_result = True
+                            break
+
+                        if stream_callback:
+                            try:
+                                await self._handle_cursor_stream_event(
+                                    event, stream_callback, tools_used
+                                )
+                            except Exception as callback_error:
+                                logger.warning(
+                                    "Stream callback failed",
+                                    error=str(callback_error),
+                                    error_type=type(callback_error).__name__,
+                                )
+                    except json.JSONDecodeError:
+                        # cursor-agent may emit a banner/error on stderr (merged
+                        # into stdout) that isn't valid JSON. Log at debug.
+                        logger.debug(
+                            "Non-JSON line from Cursor output",
+                            line=line_str[:200],
                         )
                     except Exception as e:
                         logger.warning(
@@ -149,19 +246,16 @@ class CursorAgentManager:
                             error=str(e),
                         )
 
-            # Start reading stdout (stderr is merged into stdout)
-            stdout_task = asyncio.create_task(_read_stdout())
-
             # Execute with timeout and retry, racing against optional interrupt
-            max_attempts = max(1, getattr(self.config, 'cursor_retry_max_attempts', 3))
+            max_attempts = max(1, self.config.cursor_retry_max_attempts)
             last_exc: Optional[BaseException] = None
 
             for attempt in range(max_attempts):
                 if attempt > 0:
                     delay = min(
-                        getattr(self.config, 'cursor_retry_base_delay', 1.0)
-                        * (getattr(self.config, 'cursor_retry_backoff_factor', 2.0) ** (attempt - 1)),
-                        getattr(self.config, 'cursor_retry_max_delay', 10.0),
+                        self.config.cursor_retry_base_delay
+                        * (self.config.cursor_retry_backoff_factor ** (attempt - 1)),
+                        self.config.cursor_retry_max_delay,
                     )
                     logger.warning(
                         "Retrying Cursor Agent command",
@@ -171,7 +265,7 @@ class CursorAgentManager:
                     )
                     await asyncio.sleep(delay)
 
-                # Reset for retry
+                # Reset state for this attempt
                 messages.clear()
                 tools_used.clear()
                 interrupted = False
@@ -179,70 +273,60 @@ class CursorAgentManager:
                 result_content = None
                 cost = 0.0
 
-                # Re-create process for retry
+                # Spawn a fresh process for this attempt
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     cwd=str(working_directory),
                     env=env,
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
                     limit=1024 * 1024,
+                    start_new_session=True,
                 )
 
-                # Restart readers
-                stdout_task = asyncio.create_task(_read_stdout())
-                stderr_task = asyncio.create_task(_read_stderr())
+                stdout_task = asyncio.create_task(_read_stdout(process))
 
                 interrupt_watcher: Optional["asyncio.Task[None]"] = None
                 if interrupt_event is not None:
+                    proc_ref = process
 
                     async def _cancel_on_interrupt() -> None:
                         nonlocal interrupted
                         await interrupt_event.wait()
                         interrupted = True
-                        if process.returncode is None:
-                            process.terminate()
-                            try:
-                                await process.wait()
-                            except Exception:
-                                pass
+                        await self._terminate_process_tree(proc_ref)
 
                     interrupt_watcher = asyncio.create_task(_cancel_on_interrupt())
 
                 try:
-                    # Wait for process to complete
-                    returncode = await asyncio.wait_for(
-                        process.wait(),
-                        timeout=getattr(self.config, 'cursor_timeout_seconds', 120),
-                    )
+                    # Wait for stdout reader first — it breaks on EOF or
+                    # after receiving the ``result`` event (cursor-agent may
+                    # keep the process alive long after the result is sent).
+                    timeout_s = self.config.cursor_timeout_seconds
+                    await asyncio.wait_for(stdout_task, timeout=timeout_s)
 
-                    # Wait for readers to finish
-                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                    # Terminate the process if it hasn't exited yet
+                    # (cursor-agent often hangs after emitting the result).
+                    if process.returncode is None:
+                        await self._terminate_process_tree(process)
+                    returncode = process.returncode or 0
 
-                    if returncode == 0 or interrupted:
+                    if returncode == 0 or interrupted or got_result:
                         break  # success or user interrupted
                     else:
                         # Process failed
-                        raise ClaudeProcessError(f"Cursor Agent exited with code {returncode}")
+                        raise ClaudeProcessError(
+                            f"Cursor Agent exited with code {returncode}"
+                        )
 
                 except asyncio.TimeoutError:
+                    await self._terminate_process_tree(process)
                     if not interrupted:
-                        # Timeout - don't retry
-                        process.terminate()
-                        try:
-                            await process.wait()
-                        except Exception:
-                            pass
                         raise ClaudeTimeoutError(
-                            f"Cursor Agent timed out after {getattr(self.config, 'cursor_timeout_seconds', 120)}s"
+                            f"Cursor Agent timed out after {self.config.cursor_timeout_seconds}s"
                         )
                     else:
-                        # User interrupted during timeout
-                        process.terminate()
-                        try:
-                            await process.wait()
-                        except Exception:
-                            pass
                         break
                 except Exception as exc:
                     if self._is_retryable_error(exc) and attempt < max_attempts - 1:
@@ -252,13 +336,7 @@ class CursorAgentManager:
                             attempt=attempt + 1,
                             error=str(exc),
                         )
-                        # Clean up process
-                        if process.returncode is None:
-                            process.terminate()
-                            try:
-                                await process.wait()
-                            except Exception:
-                                pass
+                        await self._terminate_process_tree(process)
                         continue
                     else:
                         # Non-retryable or attempts exhausted
@@ -268,7 +346,7 @@ class CursorAgentManager:
                         interrupt_watcher.cancel()
                         try:
                             await interrupt_watcher
-                        except Exception:
+                        except (asyncio.CancelledError, Exception):
                             pass
 
             else:
@@ -281,49 +359,75 @@ class CursorAgentManager:
             if not stdout_task.done():
                 stdout_task.cancel()
 
-            # Extract information from collected messages
+            # Extract information from collected messages.
+            # Schema reference (verified empirically):
+            #   {"type":"system","subtype":"init","session_id":"...",...}
+            #   {"type":"user","message":{"content":[{"type":"text","text":"..."}]},...}
+            #   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]},...}
+            #   {"type":"tool_call","subtype":"started|completed",
+            #     "tool_call":{"<name>ToolCall":{"args":{...},"result":{...}?}}, ...}
+            #   {"type":"result","subtype":"success","result":"<final text>",
+            #     "session_id":"...","duration_ms":N,"is_error":bool,"usage":{...}}
+            assistant_text_parts: List[str] = []
+            reported_duration_ms: Optional[int] = None
+            is_error = False
+
             for message in messages:
                 msg_type = message.get("type", "")
 
-                if msg_type == "result":
-                    # Final result message
-                    result_content = message.get("output", "")
-                    cursor_session_id = message.get("sessionId", cursor_session_id)
-                    # Cursor might not provide cost/turns - use defaults or calculate
-                    cost = float(message.get("cost", 0.0))
-                    # num_turns might need to be calculated from message count
+                if msg_type == "system" and message.get("subtype") == "init":
+                    sid = message.get("session_id")
+                    if sid:
+                        cursor_session_id = sid
 
-                elif msg_type == "tool-use":
-                    # Tool usage
-                    tool_name = message.get("tool", {}).get("name", "unknown")
-                    tools_used.append({
-                        "name": tool_name,
-                        "timestamp": asyncio.get_event_loop().time(),
-                        "input": message.get("tool", {}).get("input", {}),
-                    })
+                elif msg_type == "result":
+                    result_content = str(message.get("result") or "")
+                    sid = message.get("session_id")
+                    if sid:
+                        cursor_session_id = sid
+                    if isinstance(message.get("duration_ms"), (int, float)):
+                        reported_duration_ms = int(message["duration_ms"])
+                    is_error = bool(message.get("is_error", False))
+                    # cursor-agent does not currently report dollar cost;
+                    # leave at 0.0 (token usage is in message["usage"] if needed).
+
+                elif msg_type == "tool_call" and message.get("subtype") == "started":
+                    tool_call_obj = message.get("tool_call") or {}
+                    tool_name = _extract_cursor_tool_name(tool_call_obj)
+                    # Args are nested one level deeper under the tool key
+                    args: Dict[str, Any] = {}
+                    for v in tool_call_obj.values():
+                        if isinstance(v, dict) and isinstance(v.get("args"), dict):
+                            args = v["args"]
+                            break
+                    tools_used.append(
+                        {
+                            "name": tool_name,
+                            "timestamp": asyncio.get_event_loop().time(),
+                            "input": args,
+                        }
+                    )
 
                 elif msg_type == "assistant":
-                    # Assistant message content
-                    if not result_content:
-                        result_content = message.get("content", "")
+                    text = _extract_cursor_message_text(message)
+                    if text:
+                        assistant_text_parts.append(text)
 
-            # Calculate duration
-            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            # Calculate duration (prefer cursor-agent's reported value)
+            duration_ms = (
+                reported_duration_ms
+                if reported_duration_ms is not None
+                else int((asyncio.get_event_loop().time() - start_time) * 1000)
+            )
 
             # Use Cursor's session_id if available, otherwise fall back
             final_session_id = cursor_session_id or session_id or ""
 
-            # Use result content or extract from messages
-            if result_content is None:
-                content_parts = []
-                for message in messages:
-                    if message.get("type") == "assistant":
-                        content = message.get("content", "")
-                        if content:
-                            content_parts.append(content)
-                content = "\n".join(content_parts).strip()
+            # Prefer the explicit result; fall back to concatenated assistant text
+            if result_content:
+                content = result_content.strip()
             else:
-                content = str(result_content).strip()
+                content = "\n".join(assistant_text_parts).strip()
 
             if not content and tools_used:
                 tool_names = [
@@ -340,7 +444,10 @@ class CursorAgentManager:
                 session_id=final_session_id,
                 cost=cost,
                 duration_ms=duration_ms,
-                num_turns=len([m for m in messages if m.get("type") in ("user", "assistant")]),
+                num_turns=len(
+                    [m for m in messages if m.get("type") in ("user", "assistant")]
+                ),
+                is_error=is_error,
                 tools_used=tools_used,
                 interrupted=interrupted,
             )
@@ -348,14 +455,16 @@ class CursorAgentManager:
         except asyncio.TimeoutError:
             logger.error(
                 "Cursor Agent command timed out",
-                timeout_seconds=getattr(self.config, 'cursor_timeout_seconds', 120),
+                timeout_seconds=self.config.cursor_timeout_seconds,
             )
             raise ClaudeTimeoutError(
-                f"Cursor Agent timed out after {getattr(self.config, 'cursor_timeout_seconds', 120)}s"
+                f"Cursor Agent timed out after {self.config.cursor_timeout_seconds}s"
             )
 
         except Exception as e:
-            logger.error("Cursor Agent error", error=str(e), error_type=type(e).__name__)
+            logger.error(
+                "Cursor Agent error", error=str(e), error_type=type(e).__name__
+            )
             # Map common Cursor errors to our exception types
             error_str = str(e).lower()
             if "mcp" in error_str:
@@ -376,92 +485,117 @@ class CursorAgentManager:
         stream_callback: Callable[[StreamUpdate], None],
         tools_used: List[Dict[str, Any]],
     ) -> None:
-        """Handle streaming event from Cursor Agent and convert to StreamUpdate."""
+        """Convert a cursor-agent stream-json event into a StreamUpdate.
+
+        Event shapes (verified against ``cursor-agent --output-format stream-json``):
+          - system/init:  {"type":"system","subtype":"init","session_id":"...",
+                           "model":"...","cwd":"..."}
+          - user:         {"type":"user","message":{"content":[{"type":"text",
+                           "text":"..."}]}, "session_id":"..."}
+          - assistant:    {"type":"assistant","message":{"content":[{"type":"text",
+                           "text":"..."}]}, "session_id":"..."}
+          - tool_call:    {"type":"tool_call","subtype":"started"|"completed",
+                           "call_id":"...","tool_call":{"<name>ToolCall":{
+                           "args":{...},"result":{...}?}}, ...}
+          - result:       {"type":"result","subtype":"success","result":"...",
+                           "session_id":"...","duration_ms":N,"is_error":bool,
+                           "usage":{...}}
+        """
         try:
             event_type = event.get("type", "")
 
-            if event_type == "assistant":
-                # Assistant message
-                content = event.get("output", "")
-                tool_calls = []
-
-                # Extract tool calls if present
-                if "toolUse" in event:
-                    tool_use = event["toolUse"]
-                    tool_calls.append({
-                        "name": tool_use.get("name", "unknown"),
-                        "input": tool_use.get("input", {}),
-                        "id": tool_use.get("id", ""),
-                    })
-
+            if event_type == "system" and event.get("subtype") == "init":
                 update = StreamUpdate(
-                    type="assistant",
-                    content=content if content else None,
-                    tool_calls=tool_calls if tool_calls else None,
+                    type="system",
+                    metadata={
+                        "session_id": event.get("session_id"),
+                        "model": event.get("model"),
+                        "cwd": event.get("cwd"),
+                    },
                 )
                 await stream_callback(update)
+
+            elif event_type == "assistant":
+                text = _extract_cursor_message_text(event)
+                if text:
+                    await stream_callback(StreamUpdate(type="assistant", content=text))
 
             elif event_type == "user":
-                # User message
-                content = event.get("output", "")
-                if content:
-                    update = StreamUpdate(
-                        type="user",
-                        content=content,
+                text = _extract_cursor_message_text(event)
+                if text:
+                    await stream_callback(StreamUpdate(type="user", content=text))
+
+            elif event_type == "tool_call":
+                subtype = event.get("subtype", "")
+                tool_call_obj = event.get("tool_call") or {}
+                tool_name = _extract_cursor_tool_name(tool_call_obj)
+
+                # Args and (on completion) result are nested under the tool key
+                args: Dict[str, Any] = {}
+                tool_result: Any = None
+                for v in tool_call_obj.values():
+                    if isinstance(v, dict):
+                        if isinstance(v.get("args"), dict):
+                            args = v["args"]
+                        if "result" in v:
+                            tool_result = v["result"]
+                        break
+
+                if subtype == "started":
+                    await stream_callback(
+                        StreamUpdate(
+                            type="assistant",
+                            tool_calls=[
+                                {
+                                    "name": tool_name,
+                                    "input": args,
+                                    "id": event.get("call_id", ""),
+                                }
+                            ],
+                        )
                     )
-                    await stream_callback(update)
-
-            elif event_type == "tool-result":
-                # Tool result
-                tool_name = event.get("tool", {}).get("name", "unknown")
-                content = event.get("output", "")
-
-                update = StreamUpdate(
-                    type="tool_result",
-                    content=content,
-                    metadata={
-                        "tool_name": tool_name,
-                        "tool_output": event.get("output", {}),
-                    }
-                )
-                await stream_callback(update)
-
-            elif event_type == "progress":
-                # Progress update
-                progress_info = event.get("progress", {})
-                update = StreamUpdate(
-                    type="progress",
-                    content=None,
-                    progress=progress_info,
-                )
-                await stream_callback(update)
+                elif subtype == "completed":
+                    await stream_callback(
+                        StreamUpdate(
+                            type="tool_result",
+                            metadata={
+                                "tool_name": tool_name,
+                                "tool_output": tool_result,
+                                "call_id": event.get("call_id"),
+                            },
+                        )
+                    )
 
             elif event_type == "result":
-                # Final result
-                update = StreamUpdate(
-                    type="result",
-                    content=event.get("output", ""),
-                    metadata={
-                        "sessionId": event.get("sessionId"),
-                        "totalCost": event.get("cost", 0.0),
-                    }
+                await stream_callback(
+                    StreamUpdate(
+                        type="result",
+                        content=str(event.get("result") or ""),
+                        metadata={
+                            "session_id": event.get("session_id"),
+                            "is_error": bool(event.get("is_error", False)),
+                            "duration_ms": event.get("duration_ms"),
+                            "usage": event.get("usage"),
+                        },
+                    )
                 )
-                await stream_callback(update)
 
             elif event_type == "error":
-                # Error event
-                error_msg = event.get("message", "Unknown error")
-                update = StreamUpdate(
-                    type="error",
-                    content=error_msg,
-                    metadata={"is_error": True}
+                error_msg = (
+                    event.get("message") or event.get("error") or "Unknown error"
                 )
-                await stream_callback(update)
+                await stream_callback(
+                    StreamUpdate(
+                        type="error",
+                        content=str(error_msg),
+                        metadata={"is_error": True},
+                    )
+                )
 
         except Exception as e:
             logger.warning(
                 "Failed to handle Cursor stream event",
                 error=str(e),
-                event=event,
+                event_type=event.get("type"),
             )
             # Don't re-raise to avoid breaking the stream
