@@ -337,6 +337,7 @@ class MessageOrchestrator:
             ("deploy", command.deploy_command),
             ("restart", command.restart_command),
             ("cursor", self.agentic_cursor),
+            ("cursor_usage", self.agentic_cursor_usage),
             ("backend", self.agentic_backend),
         ]
         if self.settings.enable_project_threads:
@@ -478,6 +479,7 @@ class MessageOrchestrator:
                 BotCommand("usage", "Show Claude plan usage"),
                 BotCommand("resume", "Adopt an external Claude session"),
                 BotCommand("cursor", "Use Cursor Agent for this request"),
+                BotCommand("cursor_usage", "Show Cursor subscription usage"),
                 BotCommand("backend", "Switch default backend (claude/cursor)"),
                 BotCommand("version", "Show running bot code revision"),
                 BotCommand("deploy", "Pull latest bot code and restart"),
@@ -612,6 +614,46 @@ class MessageOrchestrator:
         if not claude_session_id and not cursor_session_id:
             msg += "\nNo active sessions"
         await update.message.reply_text(msg, parse_mode="HTML")
+
+    async def agentic_cursor_usage(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show Cursor subscription usage (% of included quota)."""
+        from src.cursor.usage import CursorUsageError, fetch_cursor_usage
+
+        try:
+            usage = await fetch_cursor_usage()
+        except CursorUsageError as e:
+            await update.message.reply_text(f"Cursor usage unavailable: {e}")
+            return
+        except Exception as e:
+            logger.warning("Cursor usage fetch failed", error=str(e))
+            await update.message.reply_text(
+                "Cursor usage unavailable (unexpected error)."
+            )
+            return
+
+        spent = usage.total_spend / 100
+        limit = usage.limit / 100
+        msg = (
+            f"📊 <b>Cursor usage</b>\n"
+            f"{usage.total_percent_used:.1f}% of included "
+            f"(${spent:.2f} / ${limit:.2f})\n"
+            f"Auto model: {usage.auto_percent_used:.1f}%"
+        )
+        if usage.display_message:
+            msg += f"\n<i>{escape_html(usage.display_message)}</i>"
+
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=update.effective_user.id,
+                command="cursor_usage",
+                args=[],
+                success=True,
+            )
 
     def _get_preferred_backend(self, context: ContextTypes.DEFAULT_TYPE) -> str:
         """Return per-user preferred backend: ``'claude'`` (default) or ``'cursor'``."""
