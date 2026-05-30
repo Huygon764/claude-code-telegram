@@ -15,6 +15,8 @@ This bot connects Telegram to Claude Code, providing a conversational AI interfa
 - **Receive proactive notifications** from webhooks, scheduled jobs, and CI/CD events
 - **Stay secure** with built-in authentication, directory sandboxing, and audit logging
 
+> **Fork additions:** this fork adds a Cursor Agent + 9Router backend, `/review`, `/usage`, `/resume`, `/version`, and a self-restart supervisor for `/restart` and `/deploy`. See [docs/fork-features.md](docs/fork-features.md).
+
 ## Quick Start
 
 ### Demo
