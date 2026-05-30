@@ -25,6 +25,7 @@ from src.events.bus import EventBus
 from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
+from src.nine_router import NineRouterProcessManager
 from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.scheduler import JobScheduler
@@ -152,6 +153,30 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         session_manager=claude_session_manager,
     )
 
+    # 9Router reuses Claude SDK with a separate session table and routing env.
+    nine_router_integration = None
+    if config.nine_router_enabled:
+        nine_router_session_storage = SQLiteSessionStorage(
+            storage.db_manager, table_name="nine_router_sessions"
+        )
+        await nine_router_session_storage.ensure_table()
+        nine_router_session_manager = SessionManager(
+            config, nine_router_session_storage
+        )
+        nine_router_integration = ClaudeIntegration(
+            config=config,
+            sdk_manager=claude_sdk_manager,
+            session_manager=nine_router_session_manager,
+            routing="nine_router",
+        )
+        logger.info(
+            "9Router backend enabled",
+            base_url=config.nine_router_base_url,
+            model=config.nine_router_model,
+        )
+
+    nine_router_process_manager = NineRouterProcessManager(config)
+
     # Create Cursor integration components with separate session storage.
     # Cursor uses its own SQLite table so resumable-session lookup does not
     # accidentally pick up a Claude session UUID (and vice versa).
@@ -200,6 +225,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "rate_limiter": rate_limiter,
         "audit_logger": audit_logger,
         "claude_integration": claude_integration,
+        "nine_router_integration": nine_router_integration,
+        "nine_router_process_manager": nine_router_process_manager,
         "cursor_integration": cursor_integration,
         "storage": storage,
         "event_bus": event_bus,

@@ -39,6 +39,7 @@ from .exceptions import (
     ClaudeTimeoutError,
 )
 from .monitor import _is_claude_internal_path, check_bash_directory_boundary
+from .routing import AnthropicRouting, anthropic_routing_env
 
 logger = structlog.get_logger()
 
@@ -277,6 +278,7 @@ class ClaudeSDKManager:
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
+        routing: AnthropicRouting = "direct",
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -286,8 +288,35 @@ class ClaudeSDKManager:
             working_directory=str(working_directory),
             session_id=session_id,
             continue_session=continue_session,
+            routing=routing,
         )
 
+        with anthropic_routing_env(self.config, routing):
+            return await self._execute_command_inner(
+                prompt=prompt,
+                working_directory=working_directory,
+                session_id=session_id,
+                continue_session=continue_session,
+                stream_callback=stream_callback,
+                interrupt_event=interrupt_event,
+                images=images,
+                routing=routing,
+                start_time=start_time,
+            )
+
+    async def _execute_command_inner(
+        self,
+        prompt: str,
+        working_directory: Path,
+        session_id: Optional[str],
+        continue_session: bool,
+        stream_callback: Optional[Callable[[StreamUpdate], None]],
+        interrupt_event: Optional[asyncio.Event],
+        images: Optional[List[Dict[str, str]]],
+        routing: AnthropicRouting,
+        start_time: float,
+    ) -> ClaudeResponse:
+        """Run SDK command under the active routing env."""
         try:
             # Capture stderr from Claude CLI for better error diagnostics
             stderr_lines: List[str] = []
@@ -319,9 +348,14 @@ class ClaudeSDKManager:
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
 
             # Build Claude Agent options
+            if routing == "nine_router" and self.config.nine_router_model:
+                sdk_model = self.config.nine_router_model
+            else:
+                sdk_model = self.config.claude_model or None
+
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
-                model=self.config.claude_model or None,
+                model=sdk_model,
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
                 allowed_tools=sdk_allowed_tools,

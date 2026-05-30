@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 import structlog
 
 from ..config.settings import Settings
+from .routing import AnthropicRouting
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import SessionManager
 
@@ -24,9 +25,11 @@ class ClaudeIntegration:
         config: Settings,
         sdk_manager: Optional[ClaudeSDKManager] = None,
         session_manager: Optional[SessionManager] = None,
+        routing: AnthropicRouting = "direct",
     ):
         """Initialize Claude integration facade."""
         self.config = config
+        self.routing = routing
         self.sdk_manager = sdk_manager or ClaudeSDKManager(config)
         self.session_manager = session_manager
 
@@ -49,6 +52,7 @@ class ClaudeIntegration:
             session_id=session_id,
             prompt_length=len(prompt),
             force_new=force_new,
+            routing=self.routing,
         )
 
         # If no session_id provided, try to find an existing session for this
@@ -171,6 +175,7 @@ class ClaudeIntegration:
             stream_callback=stream_callback,
             interrupt_event=interrupt_event,
             images=images,
+            routing=self.routing,
         )
 
     async def _find_resumable_session(

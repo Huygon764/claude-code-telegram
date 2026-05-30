@@ -16,7 +16,7 @@ from .models import SessionModel
 logger = structlog.get_logger()
 
 
-_VALID_TABLE_NAMES = {"sessions", "cursor_sessions"}
+_VALID_TABLE_NAMES = {"sessions", "cursor_sessions", "nine_router_sessions"}
 
 
 class SQLiteSessionStorage(SessionStorage):

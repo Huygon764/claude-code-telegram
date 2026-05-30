@@ -207,6 +207,42 @@ class Settings(BaseSettings):
         ),
     )
 
+    # 9Router settings (local Anthropic-compatible proxy)
+    nine_router_base_url: str = Field(
+        "http://localhost:20128",
+        description="9Router base URL (same as 9on ANTHROPIC_BASE_URL)",
+    )
+    nine_router_auth_token: Optional[SecretStr] = Field(
+        None,
+        description="9Router API key from dashboard (enables /backend 9router)",
+    )
+    nine_router_model: Optional[str] = Field(
+        "Free-models",
+        description="Model name or combo route configured in 9Router",
+    )
+    nine_router_container_name: str = Field(
+        "9router",
+        description="Docker container name for /9router start|stop",
+    )
+    nine_router_repo_path: Optional[str] = Field(
+        None,
+        description="Path to 9Router repo (for first-time docker build via start.sh)",
+    )
+    nine_router_start_script: str = Field(
+        "start.sh",
+        description="Script in NINE_ROUTER_REPO_PATH used when container is missing",
+    )
+    nine_router_start_timeout_seconds: float = Field(
+        300.0,
+        ge=30.0,
+        description="Timeout for the initial 9Router install/build script",
+    )
+    nine_router_health_wait_seconds: float = Field(
+        60.0,
+        ge=5.0,
+        description="How long to wait for /api/health after docker start",
+    )
+
     # Rate limiting
     rate_limit_requests: int = Field(
         DEFAULT_RATE_LIMIT_REQUESTS, description="Requests per window"
@@ -578,6 +614,20 @@ class Settings(BaseSettings):
             if self.anthropic_api_key
             else None
         )
+
+    @property
+    def nine_router_auth_token_str(self) -> Optional[str]:
+        """Get 9Router auth token as string."""
+        return (
+            self.nine_router_auth_token.get_secret_value()
+            if self.nine_router_auth_token
+            else None
+        )
+
+    @property
+    def nine_router_enabled(self) -> bool:
+        """True when 9Router backend can be selected via Telegram."""
+        return bool(self.nine_router_auth_token_str and self.nine_router_base_url)
 
     @property
     def mistral_api_key_str(self) -> Optional[str]:

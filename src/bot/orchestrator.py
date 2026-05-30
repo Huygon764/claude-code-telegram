@@ -339,6 +339,7 @@ class MessageOrchestrator:
             ("cursor", self.agentic_cursor),
             ("cursor_usage", self.agentic_cursor_usage),
             ("backend", self.agentic_backend),
+            ("9router", self.agentic_nine_router),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -480,7 +481,8 @@ class MessageOrchestrator:
                 BotCommand("resume", "Adopt an external Claude session"),
                 BotCommand("cursor", "Use Cursor Agent for this request"),
                 BotCommand("cursor_usage", "Show Cursor subscription usage"),
-                BotCommand("backend", "Switch default backend (claude/cursor)"),
+                BotCommand("backend", "Switch backend (claude/9router/cursor)"),
+                BotCommand("9router", "Start/stop 9Router (start|stop|status)"),
                 BotCommand("version", "Show running bot code revision"),
                 BotCommand("deploy", "Pull latest bot code and restart"),
                 BotCommand("restart", "Restart the bot"),
@@ -574,6 +576,7 @@ class MessageOrchestrator:
     ) -> None:
         """Reset session, one-line confirmation."""
         context.user_data["claude_session_id"] = None
+        context.user_data["nine_router_session_id"] = None
         context.user_data["cursor_session_id"] = None
         context.user_data["preferred_backend"] = "claude"
         context.user_data["session_started"] = True
@@ -591,6 +594,7 @@ class MessageOrchestrator:
         dir_display = str(current_dir)
 
         claude_session_id = context.user_data.get("claude_session_id")
+        nine_router_session_id = context.user_data.get("nine_router_session_id")
         cursor_session_id = context.user_data.get("cursor_session_id")
 
         # Cost info (Claude-specific for now)
@@ -609,9 +613,15 @@ class MessageOrchestrator:
         msg = f"📂 {dir_display} · Backend: {backend}{cost_str}"
         if claude_session_id:
             msg += f"\n🆔 Claude: <code>{claude_session_id}</code>"
+        if nine_router_session_id:
+            msg += f"\n🆔 9router: <code>{nine_router_session_id}</code>"
         if cursor_session_id:
             msg += f"\n🆔 Cursor: <code>{cursor_session_id}</code>"
-        if not claude_session_id and not cursor_session_id:
+        if (
+            not claude_session_id
+            and not nine_router_session_id
+            and not cursor_session_id
+        ):
             msg += "\nNo active sessions"
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -655,9 +665,47 @@ class MessageOrchestrator:
                 success=True,
             )
 
+    def _backend_choices(self) -> tuple[str, ...]:
+        """Backends available for /backend."""
+        if self.settings.nine_router_enabled:
+            return ("claude", "9router", "cursor")
+        return ("claude", "cursor")
+
     def _get_preferred_backend(self, context: ContextTypes.DEFAULT_TYPE) -> str:
-        """Return per-user preferred backend: ``'claude'`` (default) or ``'cursor'``."""
+        """Return per-user preferred backend: claude (default), 9router, or cursor."""
         return str(context.user_data.get("preferred_backend") or "claude")
+
+    def _get_claude_integration(self, context: ContextTypes.DEFAULT_TYPE) -> Any:
+        """Claude SDK integration for the active Claude-family backend."""
+        backend = self._get_preferred_backend(context)
+        if backend == "9router":
+            return context.bot_data.get("nine_router_integration")
+        return context.bot_data.get("claude_integration")
+
+    @staticmethod
+    def _session_id_key_for_backend(backend: str) -> str:
+        if backend == "9router":
+            return "nine_router_session_id"
+        if backend == "cursor":
+            return "cursor_session_id"
+        return "claude_session_id"
+
+    def _resolve_backend(
+        self, context: ContextTypes.DEFAULT_TYPE
+    ) -> tuple[str, str, Any, Optional[str]]:
+        """Resolve active backend, its session-id key, integration, and an
+        unavailability message (None when the integration is ready)."""
+        backend = self._get_preferred_backend(context)
+        session_key = self._session_id_key_for_backend(backend)
+        integration = self._get_claude_integration(context)
+        if integration is None:
+            error = (
+                "9Router not configured. Set NINE_ROUTER_AUTH_TOKEN in .env."
+                if backend == "9router"
+                else "Claude integration not available. Check configuration."
+            )
+            return backend, session_key, None, error
+        return backend, session_key, integration, None
 
     @staticmethod
     def _prepend_agent_header(
@@ -722,13 +770,15 @@ class MessageOrchestrator:
     async def agentic_backend(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Switch default backend: /backend [claude|cursor]."""
+        """Switch default backend: /backend [claude|9router|cursor]."""
+        choices = self._backend_choices()
         args = update.message.text.split()[1:] if update.message.text else []
         if not args:
             current = self._get_preferred_backend(context)
+            options = "|".join(choices)
             await update.message.reply_text(
                 f"Backend: <b>{current}</b>\n\n"
-                "Usage: <code>/backend claude|cursor</code>\n"
+                f"Usage: <code>/backend {options}</code>\n"
                 "Text messages route to the chosen backend.\n"
                 "<code>/cursor</code> always sends to Cursor regardless.",
                 parse_mode="HTML",
@@ -736,10 +786,9 @@ class MessageOrchestrator:
             return
 
         choice = args[0].lower().strip()
-        if choice not in ("claude", "cursor"):
-            await update.message.reply_text(
-                "Please use: /backend claude or /backend cursor"
-            )
+        if choice not in choices:
+            options = " or /backend ".join(choices)
+            await update.message.reply_text(f"Please use: /backend {options}")
             return
 
         context.user_data["preferred_backend"] = choice
@@ -747,6 +796,63 @@ class MessageOrchestrator:
             f"Backend set to <b>{choice}</b>",
             parse_mode="HTML",
         )
+
+    async def agentic_nine_router(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Manage local 9Router: /9router [start|stop|status]."""
+        manager = context.bot_data.get("nine_router_process_manager")
+        if manager is None:
+            await update.message.reply_text(
+                "9Router process manager is not available. Restart the bot."
+            )
+            return
+
+        args = update.message.text.split()[1:] if update.message.text else []
+        action = args[0].lower().strip() if args else "status"
+
+        if action not in ("start", "stop", "status"):
+            await update.message.reply_text(
+                "Usage: <code>/9router start|stop|status</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        if action == "status":
+            status = await manager.status()
+            healthy = "yes" if status.healthy else "no"
+            await update.message.reply_text(
+                f"9Router container: <b>{status.container.value}</b>\n"
+                f"Healthy: <b>{healthy}</b>\n"
+                f"{status.detail}",
+                parse_mode="HTML",
+            )
+            return
+
+        progress = await update.message.reply_text(
+            f"{'Starting' if action == 'start' else 'Stopping'} 9Router..."
+        )
+        if action == "start":
+            result = await manager.start()
+        else:
+            result = await manager.stop()
+
+        healthy = "yes" if result.status.healthy else "no"
+        await progress.edit_text(
+            f"{result.message}\n\n"
+            f"Container: <b>{result.status.container.value}</b>\n"
+            f"Healthy: <b>{healthy}</b>",
+            parse_mode="HTML",
+        )
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=update.effective_user.id,
+                command=f"9router_{action}",
+                args=[],
+                success=result.success,
+            )
 
     def _format_verbose_progress(
         self,
@@ -1099,19 +1205,16 @@ class MessageOrchestrator:
         )
         self._active_requests[user_id] = active_request
 
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
+        backend, session_key, claude_integration, error = self._resolve_backend(context)
+        if error:
             self._active_requests.pop(user_id, None)
-            await progress_msg.edit_text(
-                "Claude integration not available. Check configuration.",
-                reply_markup=None,
-            )
+            await progress_msg.edit_text(error, reply_markup=None)
             return
 
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.user_data.get(session_key)
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
@@ -1164,7 +1267,7 @@ class MessageOrchestrator:
             if force_new:
                 context.user_data["force_new_session"] = False
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            context.user_data[session_key] = claude_response.session_id
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
@@ -1199,7 +1302,7 @@ class MessageOrchestrator:
                 ) + "\n\n_(Interrupted by user)_"
 
             formatted_messages = formatter.format_claude_response(response_content)
-            self._prepend_agent_header(formatted_messages, "claude")
+            self._prepend_agent_header(formatted_messages, backend)
 
         except Exception as e:
             success = False
@@ -1772,18 +1875,16 @@ class MessageOrchestrator:
                 )
                 return
 
-        # Process with Claude
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            await progress_msg.edit_text(
-                "Claude integration not available. Check configuration."
-            )
+        # Process with Claude-family backend (direct or 9Router)
+        backend, session_key, claude_integration, error = self._resolve_backend(context)
+        if error:
+            await progress_msg.edit_text(error)
             return
 
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.user_data.get(session_key)
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
@@ -1815,7 +1916,7 @@ class MessageOrchestrator:
             if force_new:
                 context.user_data["force_new_session"] = False
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            context.user_data[session_key] = claude_response.session_id
 
             from .handlers.message import _update_working_directory_from_claude_response
 
@@ -1985,17 +2086,15 @@ class MessageOrchestrator:
         images: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """Run a media-derived prompt through Claude and send responses."""
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            await progress_msg.edit_text(
-                "Claude integration not available. Check configuration."
-            )
+        backend, session_key, claude_integration, error = self._resolve_backend(context)
+        if error:
+            await progress_msg.edit_text(error)
             return
 
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.user_data.get(session_key)
         force_new = bool(context.user_data.get("force_new_session"))
 
         verbose_level = self._get_verbose_level(context)
@@ -2027,7 +2126,7 @@ class MessageOrchestrator:
         if force_new:
             context.user_data["force_new_session"] = False
 
-        context.user_data["claude_session_id"] = claude_response.session_id
+        context.user_data[session_key] = claude_response.session_id
 
         from .handlers.message import _update_working_directory_from_claude_response
 
