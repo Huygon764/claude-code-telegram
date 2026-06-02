@@ -242,6 +242,134 @@ async def test_restart_command_sends_sigterm(agentic_settings, deps):
     assert "Restarting" in msg
 
 
+async def test_augment_with_reply_anchor_bot_side_quotes_response(
+    agentic_settings, deps
+):
+    """Reply to bot's message → pointer quotes the bot response."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    anchor = MagicMock()
+    anchor.message_id = 11
+    anchor.session_id = "sess-1"
+    anchor.prompt = "Fix the auth bug"
+    anchor.response = "Fixed src/auth.py: added null check\nMore details..."
+    anchor.user_telegram_message_id = 41
+    anchor.bot_telegram_message_id = 42
+
+    storage = MagicMock()
+    storage.messages.find_by_telegram_message = AsyncMock(return_value=anchor)
+
+    update = MagicMock()
+    replied = MagicMock()
+    replied.chat.id = -100
+    replied.message_id = 42  # bot's reply id
+    update.message.reply_to_message = replied
+    context = MagicMock()
+    context.bot_data = {"storage": storage}
+
+    result = await orchestrator._augment_with_reply_anchor(update, context, "redo it")
+
+    assert "your earlier message" in result
+    assert "Fixed src/auth.py: added null check" in result
+    assert result.endswith("redo it")
+
+
+async def test_augment_with_reply_anchor_user_side_quotes_prompt(
+    agentic_settings, deps
+):
+    """Reply to user's own prompt → pointer quotes the user's prompt."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    anchor = MagicMock()
+    anchor.message_id = 11
+    anchor.session_id = "sess-1"
+    anchor.prompt = "Fix the auth bug"
+    anchor.response = "Fixed src/auth.py: added null check"
+    anchor.user_telegram_message_id = 41
+    anchor.bot_telegram_message_id = 42
+
+    storage = MagicMock()
+    storage.messages.find_by_telegram_message = AsyncMock(return_value=anchor)
+
+    update = MagicMock()
+    replied = MagicMock()
+    replied.chat.id = -100
+    replied.message_id = 41  # user's own prompt id
+    update.message.reply_to_message = replied
+    context = MagicMock()
+    context.bot_data = {"storage": storage}
+
+    result = await orchestrator._augment_with_reply_anchor(update, context, "expand")
+
+    assert "their own earlier message" in result
+    assert "Fix the auth bug" in result
+    # The bot response must NOT be quoted as if the user pointed at it.
+    assert "Fixed src/auth.py" not in result
+    assert result.endswith("expand")
+
+
+async def test_augment_with_reply_anchor_no_reply_returns_original(
+    agentic_settings, deps
+):
+    """No reply_to_message → original prompt unchanged."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update = MagicMock()
+    update.message.reply_to_message = None
+    context = MagicMock()
+    context.bot_data = {"storage": MagicMock()}
+
+    result = await orchestrator._augment_with_reply_anchor(update, context, "hello")
+    assert result == "hello"
+
+
+async def test_augment_with_reply_anchor_unknown_message_falls_back_to_telegram_text(
+    agentic_settings, deps
+):
+    """DB miss but Telegram exposes the quoted text → fallback to that text."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    storage = MagicMock()
+    storage.messages.find_by_telegram_message = AsyncMock(return_value=None)
+
+    update = MagicMock()
+    replied = MagicMock()
+    replied.chat.id = -100
+    replied.message_id = 999
+    replied.text = "Some prior message text"
+    replied.caption = None
+    update.message.reply_to_message = replied
+    context = MagicMock()
+    context.bot_data = {"storage": storage}
+
+    result = await orchestrator._augment_with_reply_anchor(update, context, "hello")
+    assert "Some prior message text" in result
+    assert result.endswith("hello")
+
+
+async def test_augment_with_reply_anchor_unknown_message_no_text_returns_original(
+    agentic_settings, deps
+):
+    """DB miss and no Telegram text/caption → prompt is unchanged."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    storage = MagicMock()
+    storage.messages.find_by_telegram_message = AsyncMock(return_value=None)
+
+    update = MagicMock()
+    replied = MagicMock()
+    replied.chat.id = -100
+    replied.message_id = 999
+    replied.text = None
+    replied.caption = None
+    update.message.reply_to_message = replied
+    context = MagicMock()
+    context.bot_data = {"storage": storage}
+
+    result = await orchestrator._augment_with_reply_anchor(update, context, "hello")
+    assert result == "hello"
+
+
 async def test_agentic_start_no_keyboard(agentic_settings, deps):
     """Agentic /start sends brief message without inline keyboard."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)

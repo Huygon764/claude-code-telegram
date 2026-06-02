@@ -195,6 +195,7 @@ class TestStopButtonOnProgress:
         progress_msg = AsyncMock()
         progress_msg.delete = AsyncMock()
         update.message.reply_text = AsyncMock(return_value=progress_msg)
+        update.message.reply_to_message = None
         update.effective_message = update.message
 
         context = MagicMock()
@@ -258,6 +259,7 @@ class TestStopButtonOnProgress:
         progress_msg = AsyncMock()
         progress_msg.delete = AsyncMock()
         update.message.reply_text = AsyncMock(return_value=progress_msg)
+        update.message.reply_to_message = None
         update.effective_message = update.message
 
         context = MagicMock()
@@ -303,6 +305,7 @@ class TestStopButtonOnProgress:
         progress_msg = AsyncMock()
         progress_msg.delete = AsyncMock()
         update.message.reply_text = AsyncMock(return_value=progress_msg)
+        update.message.reply_to_message = None
         update.effective_message = update.message
 
         context = MagicMock()

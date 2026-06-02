@@ -45,6 +45,9 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# Max quoted reply body injected into the Claude prompt (full turn text).
+_REPLY_QUOTE_MAX_CHARS = 8000
+
 _MEDIA_TYPE_MAP = {
     "png": "image/png",
     "jpeg": "image/jpeg",
@@ -725,6 +728,93 @@ class MessageOrchestrator:
             header = f"🤖 {backend}\n\n"
         first.text = header + (first.text or "")
 
+    @staticmethod
+    def _truncate_reply_quote(text: str) -> str:
+        body = text.strip()
+        if len(body) <= _REPLY_QUOTE_MAX_CHARS:
+            return body
+        return body[:_REPLY_QUOTE_MAX_CHARS] + "\n... (truncated)"
+
+    @staticmethod
+    def _telegram_replied_text(replied: Any) -> Optional[str]:
+        """Extract visible text from the Telegram message the user quoted."""
+        if replied.text:
+            return replied.text
+        if replied.caption:
+            return replied.caption
+        return None
+
+    async def _augment_with_reply_anchor(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        message_text: str,
+    ) -> str:
+        """Anchor the prompt to the quoted message when the user used Reply.
+
+        Prepends the full text of the message the user replied to (from
+        stored turn data when available, otherwise from Telegram). Claude
+        otherwise only sees linear session history and may miss which
+        older turn the user is referring to.
+
+        Best-effort: lookup/storage failures fall back to Telegram text;
+        if there is no quotable text, the original prompt is unchanged.
+        """
+        replied = update.message.reply_to_message
+        if not replied:
+            return message_text
+
+        label: Optional[str] = None
+        quoted_body = ""
+        anchor = None
+        anchor_side: Optional[str] = None
+
+        storage = context.bot_data.get("storage")
+        if storage:
+            try:
+                anchor = await storage.messages.find_by_telegram_message(
+                    chat_id=replied.chat.id,
+                    telegram_message_id=replied.message_id,
+                )
+            except Exception as exc:
+                logger.warning("Reply-anchor lookup failed", error=str(exc))
+
+        if anchor:
+            if (
+                anchor.user_telegram_message_id is not None
+                and replied.message_id == anchor.user_telegram_message_id
+            ):
+                quoted_body = self._truncate_reply_quote(anchor.prompt or "")
+                label = "The user is replying to their own earlier message:"
+                anchor_side = "user"
+            else:
+                quoted_body = self._truncate_reply_quote(anchor.response or "")
+                label = "The user is replying to your earlier message:"
+                anchor_side = "bot"
+        else:
+            telegram_text = self._telegram_replied_text(replied)
+            if telegram_text:
+                quoted_body = self._truncate_reply_quote(telegram_text)
+                label = "The user is replying to this message:"
+
+        if not label or not quoted_body:
+            return message_text
+
+        block = f"[{label}\n---\n{quoted_body}\n---]"
+        if anchor:
+            logger.info(
+                "Reply-anchored prompt",
+                anchor_message_id=anchor.message_id,
+                anchor_session=anchor.session_id,
+                anchor_side=anchor_side,
+            )
+        else:
+            logger.info(
+                "Reply-anchored prompt (telegram fallback)",
+                replied_message_id=replied.message_id,
+            )
+        return f"{block}\n\n{message_text}"
+
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
         user_override = context.user_data.get("verbose_level")
@@ -1160,14 +1250,25 @@ class MessageOrchestrator:
         :meth:`agentic_cursor` instead (unless ``prompt_override`` is set,
         which means an internal caller like /review explicitly wants Claude).
         """
+        user_id = update.effective_user.id
+        message_text = prompt_override or update.message.text
+
+        # Anchor to the replied-to turn when the user used Telegram's Reply UI.
+        # Done BEFORE the cursor-backend delegation below so the cursor path
+        # gets the augmented prompt too (it receives ``prompt_override`` and
+        # skips its own augmentation in that case to avoid double-anchoring).
+        # Skipped for internal callers (prompt_override) since they build
+        # their own self-contained prompts.
+        if prompt_override is None:
+            message_text = await self._augment_with_reply_anchor(
+                update, context, message_text
+            )
+
         # Route to cursor backend when preferred (skip for internal callers)
         if prompt_override is None and self._get_preferred_backend(context) == "cursor":
             return await self.agentic_cursor(
-                update, context, prompt_override=update.message.text
+                update, context, prompt_override=message_text
             )
-
-        user_id = update.effective_user.id
-        message_text = prompt_override or update.message.text
 
         logger.info(
             "Agentic text message",
@@ -1276,20 +1377,6 @@ class MessageOrchestrator:
                 claude_response, context, self.settings, user_id
             )
 
-            # Store interaction
-            storage = context.bot_data.get("storage")
-            if storage:
-                try:
-                    await storage.save_claude_interaction(
-                        user_id=user_id,
-                        session_id=claude_response.session_id,
-                        prompt=message_text,
-                        response=claude_response,
-                        ip_address=None,
-                    )
-                except Exception as e:
-                    logger.warning("Failed to log interaction", error=str(e))
-
             # Format response (no reply_markup — strip keyboards)
             from .utils.formatting import ResponseFormatter
 
@@ -1352,12 +1439,16 @@ class MessageOrchestrator:
                     logger.warning("Image+caption send failed", error=str(img_err))
 
         # Send text messages (skip if caption was already embedded in photos)
+        # Track the first reply we send so the interaction can be saved with
+        # a telegram-message-id anchor for future reply-to-quote lookups.
+        first_reply = None
         if not caption_sent:
             for i, message in enumerate(formatted_messages):
                 if not message.text or not message.text.strip():
                     continue
+                sent = None
                 try:
-                    await update.message.reply_text(
+                    sent = await update.message.reply_text(
                         message.text,
                         parse_mode=message.parse_mode,
                         reply_markup=None,  # No keyboards in agentic mode
@@ -1374,7 +1465,7 @@ class MessageOrchestrator:
                         message_index=i,
                     )
                     try:
-                        await update.message.reply_text(
+                        sent = await update.message.reply_text(
                             message.text,
                             reply_markup=None,
                             reply_to_message_id=(
@@ -1382,7 +1473,7 @@ class MessageOrchestrator:
                             ),
                         )
                     except Exception as plain_err:
-                        await update.message.reply_text(
+                        sent = await update.message.reply_text(
                             f"Failed to deliver response "
                             f"(Telegram error: {str(plain_err)[:150]}). "
                             f"Please try again.",
@@ -1390,6 +1481,8 @@ class MessageOrchestrator:
                                 update.message.message_id if i == 0 else None
                             ),
                         )
+                if first_reply is None and sent is not None:
+                    first_reply = sent
 
             # Send images separately if caption wasn't used
             if images:
@@ -1401,6 +1494,28 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # Store interaction now that we know which Telegram message anchors it.
+        # chat_id comes from the incoming message (always present) so user-side
+        # anchors work even when the bot's reply failed to send.
+        if success:
+            storage = context.bot_data.get("storage")
+            if storage:
+                try:
+                    await storage.save_claude_interaction(
+                        user_id=user_id,
+                        session_id=claude_response.session_id,
+                        prompt=message_text,
+                        response=claude_response,
+                        ip_address=None,
+                        bot_telegram_message_id=(
+                            first_reply.message_id if first_reply else None
+                        ),
+                        bot_telegram_chat_id=update.message.chat.id,
+                        user_telegram_message_id=update.message.message_id,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to log interaction", error=str(e))
 
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
@@ -1509,6 +1624,12 @@ class MessageOrchestrator:
             if not message_text.strip():
                 await update.message.reply_text("Usage: /cursor <your prompt>")
                 return
+            # Same reply-to-anchor flow as agentic_text: when the user
+            # used Telegram's Reply UI, prepend the quoted message so
+            # Cursor disambiguates which earlier turn the user means.
+            message_text = await self._augment_with_reply_anchor(
+                update, context, message_text
+            )
 
         logger.info(
             "Agentic cursor message",
@@ -1635,20 +1756,6 @@ class MessageOrchestrator:
                         cursor_response, context, self.settings, user_id
                     )
 
-                    # Store interaction
-                    storage = context.bot_data.get("storage")
-                    if storage:
-                        try:
-                            await storage.save_claude_interaction(
-                                user_id=user_id,
-                                session_id=cursor_response.session_id,
-                                prompt=message_text,
-                                response=cursor_response,
-                                ip_address=None,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to log interaction", error=str(e))
-
                     # Format response (no reply_markup -- strip keyboards)
                     from .utils.formatting import ResponseFormatter
 
@@ -1748,12 +1855,15 @@ class MessageOrchestrator:
                     logger.warning("Image+caption send failed", error=str(img_err))
 
         # Send text messages (skip if caption was already embedded in photos)
+        # Track the first reply for the telegram-message-id anchor.
+        first_reply = None
         if not caption_sent:
             for i, message in enumerate(formatted_messages):
                 if not message.text or not message.text.strip():
                     continue
+                sent = None
                 try:
-                    await update.message.reply_text(
+                    sent = await update.message.reply_text(
                         message.text,
                         parse_mode=message.parse_mode,
                         reply_markup=None,  # No keyboards in agentic mode
@@ -1770,7 +1880,7 @@ class MessageOrchestrator:
                         message_index=i,
                     )
                     try:
-                        await update.message.reply_text(
+                        sent = await update.message.reply_text(
                             message.text,
                             reply_markup=None,
                             reply_to_message_id=(
@@ -1778,7 +1888,7 @@ class MessageOrchestrator:
                             ),
                         )
                     except Exception as plain_err:
-                        await update.message.reply_text(
+                        sent = await update.message.reply_text(
                             f"Failed to deliver response "
                             f"(Telegram error: {str(plain_err)[:150]}). "
                             f"Please try again.",
@@ -1786,6 +1896,8 @@ class MessageOrchestrator:
                                 update.message.message_id if i == 0 else None
                             ),
                         )
+                if first_reply is None and sent is not None:
+                    first_reply = sent
 
             # Send images separately if caption wasn't used
             if images:
@@ -1797,6 +1909,26 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # Store interaction now that we know which Telegram message anchors it.
+        if success and cursor_response is not None:
+            storage = context.bot_data.get("storage")
+            if storage:
+                try:
+                    await storage.save_claude_interaction(
+                        user_id=user_id,
+                        session_id=cursor_response.session_id,
+                        prompt=message_text,
+                        response=cursor_response,
+                        ip_address=None,
+                        bot_telegram_message_id=(
+                            first_reply.message_id if first_reply else None
+                        ),
+                        bot_telegram_chat_id=update.message.chat.id,
+                        user_telegram_message_id=update.message.message_id,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to log interaction", error=str(e))
 
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")

@@ -396,8 +396,10 @@ class MessageRepository:
                 """
                 INSERT INTO messages
                 (session_id, user_id, timestamp, prompt,
-                 response, cost, duration_ms, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 response, cost, duration_ms, error,
+                 bot_telegram_message_id, bot_telegram_chat_id,
+                 user_telegram_message_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     message.session_id,
@@ -408,10 +410,37 @@ class MessageRepository:
                     message.cost,
                     message.duration_ms,
                     message.error,
+                    message.bot_telegram_message_id,
+                    message.bot_telegram_chat_id,
+                    message.user_telegram_message_id,
                 ),
             )
             await conn.commit()
             return cursor.lastrowid
+
+    async def find_by_telegram_message(
+        self, chat_id: int, telegram_message_id: int
+    ) -> Optional[MessageModel]:
+        """Find the stored turn for a given Telegram message id in a chat.
+
+        Matches either side of the exchange: the message_id of the bot's
+        response, or of the user's prompt. Returns ``None`` when the id
+        wasn't tracked (e.g. status output, confirmation messages, or
+        rows pre-dating the schema migration).
+        """
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE bot_telegram_chat_id = ?
+                  AND (bot_telegram_message_id = ?
+                       OR user_telegram_message_id = ?)
+                LIMIT 1
+                """,
+                (chat_id, telegram_message_id, telegram_message_id),
+            )
+            row = await cursor.fetchone()
+            return MessageModel.from_row(row) if row else None
 
     async def get_session_messages(
         self, session_id: str, limit: int = 50

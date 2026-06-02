@@ -151,6 +151,9 @@ class MessageModel:
     cost: float = 0.0
     duration_ms: Optional[int] = None
     error: Optional[str] = None
+    bot_telegram_message_id: Optional[int] = None
+    bot_telegram_chat_id: Optional[int] = None
+    user_telegram_message_id: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""

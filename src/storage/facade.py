@@ -70,8 +70,18 @@ class Storage:
         prompt: str,
         response: ClaudeResponse,
         ip_address: Optional[str] = None,
+        bot_telegram_message_id: Optional[int] = None,
+        bot_telegram_chat_id: Optional[int] = None,
+        user_telegram_message_id: Optional[int] = None,
     ):
-        """Save complete Claude interaction."""
+        """Save complete Claude interaction.
+
+        ``bot_telegram_message_id`` / ``user_telegram_message_id`` are the
+        Telegram ids of the bot's reply and the user's prompt;
+        ``bot_telegram_chat_id`` is the chat both live in. Together they
+        let future replies-to-quote (on either side of the exchange)
+        resolve back to this turn.
+        """
         logger.info(
             "Saving Claude interaction",
             user_id=user_id,
@@ -90,6 +100,9 @@ class Storage:
             cost=response.cost,
             duration_ms=response.duration_ms,
             error=response.error_type if response.is_error else None,
+            bot_telegram_message_id=bot_telegram_message_id,
+            bot_telegram_chat_id=bot_telegram_chat_id,
+            user_telegram_message_id=user_telegram_message_id,
         )
 
         message_id = await self.messages.save_message(message)

@@ -310,6 +310,36 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                5,
+                """
+                -- Map bot's outgoing Telegram messages back to their stored
+                -- interaction, so users can reply-to-quote a turn and have
+                -- the bot anchor the next prompt to that specific exchange.
+                ALTER TABLE messages
+                    ADD COLUMN bot_telegram_message_id INTEGER;
+                ALTER TABLE messages
+                    ADD COLUMN bot_telegram_chat_id INTEGER;
+
+                CREATE INDEX IF NOT EXISTS idx_messages_bot_telegram
+                    ON messages(bot_telegram_chat_id, bot_telegram_message_id);
+                """,
+            ),
+            (
+                6,
+                """
+                -- Also track the user's prompt message id so reply-to-anchor
+                -- works in both directions (user can reply-quote either the
+                -- bot's response OR their own earlier prompt). Both ids live
+                -- in the same chat — bot_telegram_chat_id stays the chat
+                -- anchor.
+                ALTER TABLE messages
+                    ADD COLUMN user_telegram_message_id INTEGER;
+
+                CREATE INDEX IF NOT EXISTS idx_messages_user_telegram
+                    ON messages(bot_telegram_chat_id, user_telegram_message_id);
+                """,
+            ),
         ]
 
     async def _init_pool(self):

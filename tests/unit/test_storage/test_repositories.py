@@ -304,6 +304,60 @@ class TestMessageRepository:
         assert messages[0].prompt == "Test prompt"
         assert messages[0].response == "Test response"
 
+    async def test_find_by_telegram_message_matches_bot_or_user_side(
+        self, message_repo, session_repo, user_repo
+    ):
+        """Look up a stored turn by either the bot's reply id or the user's
+        prompt id (within the same chat)."""
+        user = UserModel(
+            user_id=12353,
+            telegram_username="anchoruser",
+            first_seen=datetime.now(UTC),
+            last_active=datetime.now(UTC),
+            is_allowed=True,
+        )
+        await user_repo.create_user(user)
+        session = SessionModel(
+            session_id="anchor-session",
+            user_id=12353,
+            project_path="/test/anchor",
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
+        )
+        await session_repo.create_session(session)
+
+        message = MessageModel(
+            session_id="anchor-session",
+            user_id=12353,
+            timestamp=datetime.now(UTC),
+            prompt="Fix the auth bug",
+            response="Fixed src/auth.py: added null check",
+            bot_telegram_message_id=42,
+            bot_telegram_chat_id=-1009876,
+            user_telegram_message_id=41,
+        )
+        await message_repo.save_message(message)
+
+        # Match via bot's reply message id.
+        from_bot = await message_repo.find_by_telegram_message(
+            chat_id=-1009876, telegram_message_id=42
+        )
+        assert from_bot is not None
+        assert from_bot.prompt == "Fix the auth bug"
+
+        # Match via user's prompt message id.
+        from_user = await message_repo.find_by_telegram_message(
+            chat_id=-1009876, telegram_message_id=41
+        )
+        assert from_user is not None
+        assert from_user.prompt == "Fix the auth bug"
+
+        # Unknown message id returns None (not an error).
+        missing = await message_repo.find_by_telegram_message(
+            chat_id=-1009876, telegram_message_id=999
+        )
+        assert missing is None
+
 
 class TestProjectThreadRepository:
     """Test project thread repository."""
