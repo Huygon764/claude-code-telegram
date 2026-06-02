@@ -1319,6 +1319,80 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+async def cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cost — unified Claude + Cursor usage in one message.
+
+    Calls both backends' usage fetchers in parallel; either side's failure
+    is reported inline instead of failing the whole command, so a stale
+    Claude OAuth token doesn't hide Cursor numbers (and vice versa).
+    9Router routes through Claude SDK, so its consumption rolls into the
+    Claude plan windows — no separate fetcher.
+    """
+    from src.cursor.usage import CursorUsageError, fetch_cursor_usage
+
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    async def _claude() -> Tuple[bool, str]:
+        try:
+            result = await fetch_plan_usage()
+        except UsageError as exc:
+            return False, f"❌ {escape_html(str(exc))}"
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Unexpected error fetching Claude usage", error=str(exc))
+            return False, "❌ Unexpected error."
+
+        windows = result.get("windows") or {}
+        labels = {
+            "five_hour": "Session (5h)",
+            "seven_day": "Week (all)",
+            "seven_day_sonnet": "Week (Sonnet)",
+            "seven_day_opus": "Week (Opus)",
+        }
+        lines: List[str] = []
+        for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
+            w = windows.get(key)
+            if not w:
+                continue
+            util = w.get("utilization")
+            pct = float(util) if isinstance(util, (int, float)) else 0.0
+            icon = "🔴" if pct >= 90 else "🟡" if pct >= 75 else "🟢"
+            lines.append(f"  {icon} {labels.get(key, key)}: {pct:.0f}%")
+        return (True, "\n".join(lines) if lines else "  (no data)")
+
+    async def _cursor() -> Tuple[bool, str]:
+        try:
+            usage = await fetch_cursor_usage()
+        except CursorUsageError as exc:
+            return False, f"❌ {escape_html(str(exc))}"
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Unexpected error fetching Cursor usage", error=str(exc))
+            return False, "❌ Unexpected error."
+        spent = usage.total_spend / 100
+        limit = usage.limit / 100
+        return True, (
+            f"  {usage.total_percent_used:.1f}% used " f"(${spent:.2f} / ${limit:.2f})"
+        )
+
+    claude_text, cursor_text = await asyncio.gather(_claude(), _cursor())
+    claude_ok, claude_body = claude_text
+    cursor_ok, cursor_body = cursor_text
+
+    text = (
+        "💰 <b>Cost</b>\n\n"
+        f"<b>Claude</b>\n{claude_body}\n\n"
+        f"<b>Cursor</b>\n{cursor_body}"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id,
+            command="cost",
+            args=[],
+            success=claude_ok or cursor_ok,
+        )
+
+
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /resume <session_id> — adopt an external Claude session.
 

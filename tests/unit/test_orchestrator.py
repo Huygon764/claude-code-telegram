@@ -91,6 +91,7 @@ _AGENTIC_COMMANDS = {
     "review",
     "resume",
     "usage",
+    "cost",
     "version",
     "deploy",
     "restart",
@@ -116,6 +117,7 @@ _CLASSIC_COMMANDS = {
     "git",
     "resume",
     "usage",
+    "cost",
     "version",
     "deploy",
     "restart",
@@ -240,6 +242,51 @@ async def test_restart_command_sends_sigterm(agentic_settings, deps):
     update.message.reply_text.assert_called_once()
     msg = update.message.reply_text.call_args[0][0]
     assert "Restarting" in msg
+
+
+async def test_cost_command_partial_failure_shows_both_sides(agentic_settings, deps):
+    """/cost: one backend's failure must not hide the other backend's data."""
+    from unittest.mock import patch
+
+    from src.bot.handlers.command import cost_command
+    from src.claude.usage_client import UsageError
+    from src.cursor.usage import CursorUsage
+
+    update = MagicMock()
+    update.effective_user.id = 7
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.bot_data = {"audit_logger": None}
+
+    cursor_usage = CursorUsage(
+        total_spend=1234,  # cents
+        limit=5000,
+        total_percent_used=24.68,
+        auto_percent_used=10.0,
+        display_message="",
+        raw={},
+    )
+
+    with (
+        patch(
+            "src.bot.handlers.command.fetch_plan_usage",
+            new=AsyncMock(side_effect=UsageError("OAuth token expired")),
+        ),
+        patch(
+            "src.cursor.usage.fetch_cursor_usage",
+            new=AsyncMock(return_value=cursor_usage),
+        ),
+    ):
+        await cost_command(update, context)
+
+    text = update.message.reply_text.call_args[0][0]
+    # Claude side surfaced the error inline …
+    assert "OAuth token expired" in text
+    # … but the Cursor numbers are still rendered.
+    assert "24.7%" in text or "24.6%" in text  # rounding tolerance
+    assert "$12.34" in text
+    assert "$50.00" in text
 
 
 async def test_augment_with_reply_anchor_bot_side_quotes_response(
