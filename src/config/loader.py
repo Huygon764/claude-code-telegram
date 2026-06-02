@@ -207,7 +207,8 @@ def create_test_config(**overrides: Any) -> Settings:
     test_dir = Path(test_values["approved_directory"])
     test_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create settings with test values
-    settings = Settings(**test_values)
+    # Pass _env_file=None so tests never inherit the developer's local .env
+    # (otherwise live values like ENABLE_PROJECT_THREADS leak into fixtures).
+    settings = Settings(**test_values, _env_file=None)
 
     return settings

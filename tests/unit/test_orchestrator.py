@@ -82,15 +82,54 @@ def deps():
     }
 
 
-def test_agentic_registers_6_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo, restart commands."""
+_AGENTIC_COMMANDS = {
+    "start",
+    "new",
+    "status",
+    "verbose",
+    "repo",
+    "review",
+    "resume",
+    "usage",
+    "version",
+    "deploy",
+    "restart",
+    "cursor",
+    "cursor_usage",
+    "backend",
+    "9router",
+}
+
+_CLASSIC_COMMANDS = {
+    "start",
+    "help",
+    "new",
+    "continue",
+    "end",
+    "ls",
+    "cd",
+    "pwd",
+    "projects",
+    "status",
+    "export",
+    "actions",
+    "git",
+    "resume",
+    "usage",
+    "version",
+    "deploy",
+    "restart",
+}
+
+
+def test_agentic_registers_expected_commands(agentic_settings, deps):
+    """Agentic mode registers the full agentic command set."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
 
     orchestrator.register_handlers(app)
 
-    # Collect all CommandHandler registrations
     from telegram.ext import CommandHandler
 
     cmd_handlers = [
@@ -98,19 +137,13 @@ def test_agentic_registers_6_commands(agentic_settings, deps):
         for call in app.add_handler.call_args_list
         if isinstance(call[0][0], CommandHandler)
     ]
-    commands = [h[0][0].commands for h in cmd_handlers]
+    registered = {next(iter(h[0][0].commands)) for h in cmd_handlers}
 
-    assert len(cmd_handlers) == 6
-    assert frozenset({"start"}) in commands
-    assert frozenset({"new"}) in commands
-    assert frozenset({"status"}) in commands
-    assert frozenset({"verbose"}) in commands
-    assert frozenset({"repo"}) in commands
-    assert frozenset({"restart"}) in commands
+    assert registered == _AGENTIC_COMMANDS
 
 
-def test_classic_registers_14_commands(classic_settings, deps):
-    """Classic mode registers all 14 commands."""
+def test_classic_registers_expected_commands(classic_settings, deps):
+    """Classic mode registers the full classic command set."""
     orchestrator = MessageOrchestrator(classic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -124,8 +157,9 @@ def test_classic_registers_14_commands(classic_settings, deps):
         for call in app.add_handler.call_args_list
         if isinstance(call[0][0], CommandHandler)
     ]
+    registered = {next(iter(h[0][0].commands)) for h in cmd_handlers}
 
-    assert len(cmd_handlers) == 14
+    assert registered == _CLASSIC_COMMANDS
 
 
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
@@ -156,26 +190,21 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 6 bot commands."""
+    """Agentic mode returns the full agentic bot command set."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 6
-    cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart"]
+    cmd_names = {c.command for c in commands}
+    assert cmd_names == _AGENTIC_COMMANDS
 
 
 async def test_classic_bot_commands(classic_settings, deps):
-    """Classic mode returns 14 bot commands."""
+    """Classic mode returns the full classic bot command set."""
     orchestrator = MessageOrchestrator(classic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 14
-    cmd_names = [c.command for c in commands]
-    assert "start" in cmd_names
-    assert "help" in cmd_names
-    assert "git" in cmd_names
-    assert "restart" in cmd_names
+    cmd_names = {c.command for c in commands}
+    assert cmd_names == _CLASSIC_COMMANDS
 
 
 async def test_restart_command_sends_sigterm(agentic_settings, deps):
@@ -272,7 +301,8 @@ async def test_agentic_status_compact(agentic_settings, deps):
 
     call_args = update.message.reply_text.call_args
     text = call_args.args[0]
-    assert "Session: none" in text
+    assert "No active sessions" in text
+    assert "Backend:" in text
 
 
 async def test_agentic_text_calls_claude(agentic_settings, deps):

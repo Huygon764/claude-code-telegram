@@ -560,17 +560,17 @@ def test_computed_properties(tmp_path):
     assert sqlite_settings.database_path == Path("data/bot.db").resolve()
 
 
-def test_feature_flags():
+def test_feature_flags(tmp_path):
     """Test feature flag system."""
-    # Create test MCP config file with valid structure before creating settings
     mcp_config = (
         '{"mcpServers": {"test-server": {"command": "echo", "args": ["hello"]}}}'
     )
-    Path("/tmp/test_mcp.json").write_text(mcp_config)
+    mcp_path = tmp_path / "test_mcp.json"
+    mcp_path.write_text(mcp_config)
 
     settings = create_test_config(
         enable_mcp=True,
-        mcp_config_path="/tmp/test_mcp.json",
+        mcp_config_path=str(mcp_path),
         enable_git_integration=True,
         enable_file_uploads=False,
         enable_token_auth=True,
@@ -590,12 +590,8 @@ def test_feature_flags():
     assert "file_uploads" not in enabled_features
     assert "token_auth" in enabled_features
 
-    # Test generic feature check
     assert features.is_feature_enabled("git") is True
     assert features.is_feature_enabled("nonexistent") is False
-
-    # Cleanup test file
-    Path("/tmp/test_mcp.json").unlink(missing_ok=True)
 
 
 def test_environment_loading():
