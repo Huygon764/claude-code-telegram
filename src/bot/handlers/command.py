@@ -22,6 +22,7 @@ from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...storage.models import SessionModel
 from ...utils.gitinfo import STARTUP_COMMIT, bot_repo_root
+from ...utils.process_restart import request_self_restart
 from ...utils.restart_receipt import write_receipt
 from ..utils.html_format import escape_html
 
@@ -1375,8 +1376,11 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /restart command - gracefully restart the bot process.
 
-    Sends a confirmation message then triggers SIGTERM so systemd
-    (or any process manager with restart-on-exit) brings the bot back up.
+    Sends a confirmation message, requests a self re-exec, then triggers
+    SIGTERM so asyncio shuts down cleanly. After shutdown completes,
+    ``reexec_if_requested()`` in ``src/main.py`` ``run()`` replaces this
+    process with a fresh copy of itself — works under ``make run`` (no
+    supervisor), and is harmless under systemd / ``run-forever.sh``.
 
     Auth: protected by the auth middleware (group -2) which raises
     ``ApplicationHandlerStop`` for unauthenticated users before any
@@ -1408,7 +1412,8 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     logger.info("Restart requested via /restart command", user_id=user_id)
 
     # SIGTERM triggers the existing graceful-shutdown handler in main.py;
-    # systemd Restart=always will bring the process back up.
+    # after asyncio shuts down, run() re-execs this process.
+    request_self_restart()
     os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -1526,9 +1531,10 @@ async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Handle /deploy — pull latest bot code and restart.
 
     Fast-forward pull of the current branch from its configured upstream,
-    a byte-compile sanity gate, then a SIGTERM restart (requires a process
-    supervisor / make run-watch, same as /restart). On compile failure the
-    pull is rolled back and the bot is NOT restarted.
+    a byte-compile sanity gate, then a SIGTERM-triggered self re-exec
+    (same path as ``/restart`` — works without an external supervisor).
+    On compile failure the pull is rolled back and the bot is NOT
+    restarted.
     """
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
     settings: Settings = context.bot_data["settings"]
@@ -1672,6 +1678,7 @@ async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         old=old_short,
         new=new_sha,
     )
+    request_self_restart()
     os.kill(os.getpid(), signal.SIGTERM)
 
 

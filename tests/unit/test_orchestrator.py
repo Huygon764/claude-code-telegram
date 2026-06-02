@@ -178,25 +178,34 @@ async def test_classic_bot_commands(classic_settings, deps):
     assert "restart" in cmd_names
 
 
-async def test_restart_command_sends_sigterm(deps):
-    """restart_command sends SIGTERM to the current process."""
+async def test_restart_command_sends_sigterm(agentic_settings, deps):
+    """restart_command marks for re-exec then SIGTERMs the process."""
     from unittest.mock import patch
 
     from src.bot.handlers.command import restart_command
 
     update = MagicMock()
     update.effective_user.id = 123
-    update.message.reply_text = AsyncMock()
+    sent = MagicMock()
+    sent.chat_id = 42
+    sent.message_id = 7
+    sent.message_thread_id = None
+    update.message.reply_text = AsyncMock(return_value=sent)
 
     context = MagicMock()
-    context.bot_data = {"audit_logger": None}
+    context.bot_data = {"audit_logger": None, "settings": agentic_settings}
 
-    with patch("src.bot.handlers.command.os.kill") as mock_kill:
+    with (
+        patch("src.bot.handlers.command.os.kill") as mock_kill,
+        patch("src.bot.handlers.command.write_receipt"),
+        patch("src.bot.handlers.command.request_self_restart") as mock_request_restart,
+    ):
         await restart_command(update, context)
 
     import os
     import signal
 
+    mock_request_restart.assert_called_once()
     mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
     # Verify confirmation message was sent
     update.message.reply_text.assert_called_once()

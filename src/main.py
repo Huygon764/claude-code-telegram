@@ -40,6 +40,7 @@ from src.security.rate_limiter import RateLimiter
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
+from src.utils.process_restart import reexec_if_requested
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -458,6 +459,12 @@ def run() -> None:
     except KeyboardInterrupt:
         print("\nShutdown requested by user")
         sys.exit(0)
+
+    # /restart and /deploy SIGTERM the loop after marking the process for
+    # re-exec. Now that asyncio is fully shut down (sockets closed, polling
+    # stopped, DB committed), replace this process with a fresh copy of
+    # itself. Never returns on success.
+    reexec_if_requested()
 
 
 if __name__ == "__main__":

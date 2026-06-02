@@ -80,12 +80,10 @@ class ClaudeCodeBot:
             builder.proxy(proxy_url)
             logger.info("Proxy configured", proxy=proxy_url)
 
-        # post_init runs inside Application.initialize(), after the Bot is
-        # initialized but before the updater starts — the canonical "we are
-        # online" hook. Using it (instead of hand-placed calls in start())
-        # makes the notification fire exactly once in BOTH webhook and
-        # polling modes; a raw bot.send_message before initialize() would
-        # raise "Bot was not initialized" in webhook mode.
+        # post_init is invoked by PTB's run_webhook (only path it covers in
+        # this bot). It is NOT called from Application.initialize(), so in
+        # polling mode we invoke _notify_started by hand in start() after
+        # the app is running. Keeps the wire-up identical across both modes.
         builder.post_init(self._notify_started)
 
         self.app = builder.build()
@@ -231,9 +229,7 @@ class ClaudeCodeBot:
         if not chat_ids:
             return
         text = (
-            "✅ <b>Bot online</b>\n"
-            f"Running <code>{revision}</code>\n"
-            f"v{version}"
+            "✅ <b>Bot online</b>\n" f"Running <code>{revision}</code>\n" f"v{version}"
         )
         for chat_id in chat_ids:
             try:
@@ -313,8 +309,8 @@ class ClaudeCodeBot:
             self.is_running = True
 
             if self.settings.webhook_url:
-                # Webhook mode (run_webhook calls initialize() -> post_init,
-                # which fires _notify_started once the bot is online).
+                # Webhook mode: run_webhook drives post_init internally, so
+                # _notify_started fires once the bot is online.
                 await self.app.run_webhook(
                     listen="0.0.0.0",
                     port=self.settings.webhook_port,
@@ -324,16 +320,17 @@ class ClaudeCodeBot:
                     allowed_updates=Update.ALL_TYPES,
                 )
             else:
-                # Polling mode - initialize and start polling manually
+                # Polling mode - we drive initialize/start/updater manually,
+                # so PTB never calls post_init (it only fires from
+                # run_polling/run_webhook). Invoke _notify_started by hand
+                # after app.start() so the "Bot back online" edit fires.
                 await self.app.initialize()
                 await self.app.start()
+                await self._notify_started(self.app)
                 await self.app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
                 )
-
-                # _notify_started fires via post_init inside the
-                # app.initialize() call above (both modes).
 
                 # Keep running until manually stopped
                 while self.is_running:
