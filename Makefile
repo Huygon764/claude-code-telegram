@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format clean help run run-forever run-watch run-remote remote-attach remote-stop \
+.PHONY: install dev test lint format clean help run run-bare run-forever run-watch run-remote remote-attach remote-stop \
        bump-patch bump-minor bump-major release version
 
 # Default target
@@ -10,8 +10,9 @@ help:
 	@echo "  lint          - Run linting checks"
 	@echo "  format        - Format code"
 	@echo "  clean         - Clean up generated files"
-	@echo "  run           - Run the bot"
-	@echo "  run-forever   - Run the bot with a self-restart supervisor"
+	@echo "  run           - Run the bot under the self-restart supervisor"
+	@echo "  run-bare      - Run the bot once with no supervisor (debug crashes)"
+	@echo "  run-forever   - Alias for 'run' (kept for muscle memory)"
 	@echo "  run-watch     - Run the bot with auto-restart on code changes"
 	@echo "  version       - Show current version"
 	@echo "  bump-patch    - Bump patch version (1.2.0 -> 1.2.1), commit, and tag"
@@ -48,11 +49,13 @@ clean:
 	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
 	rm -rf .coverage htmlcov/ .pytest_cache/ dist/ build/
 
-run:
+run:  ## Run the bot under the self-restart supervisor (default for prod)
+	bash scripts/run-forever.sh
+
+run-bare:  ## Run the bot once with no supervisor (let crashes surface)
 	poetry run claude-telegram-bot
 
-run-forever:  ## Run the bot with a self-restart supervisor (no systemd needed)
-	bash scripts/run-forever.sh
+run-forever: run  ## Alias for 'run' — kept so existing muscle memory still works
 
 run-watch:  ## Run the bot with auto-restart on src/ changes (uses watchfiles)
 	poetry run watchfiles "claude-telegram-bot" src/
