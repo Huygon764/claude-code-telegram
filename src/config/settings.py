@@ -270,6 +270,14 @@ class Settings(BaseSettings):
     max_sessions_per_user: int = Field(
         DEFAULT_MAX_SESSIONS_PER_USER, description="Max concurrent sessions"
     )
+    stale_session_warning_hours: float = Field(
+        12.0,
+        description=(
+            "Warn the user once when resuming a Claude session after this "
+            "many hours of inactivity. Set to 0 to disable the warning."
+        ),
+        ge=0.0,
+    )
 
     # Features
     enable_mcp: bool = Field(False, description="Enable Model Context Protocol")

@@ -9,6 +9,7 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -819,6 +820,71 @@ class MessageOrchestrator:
             )
         return f"{block}\n\n{message_text}"
 
+    async def _warn_if_stale_session(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        backend: str,
+        session_id: str,
+    ) -> None:
+        """Send a one-shot warning when resuming a long-quiet Claude session.
+
+        Helps the user notice that 'that file we discussed' may be days of
+        unrelated turns away from what's relevant now — and offers /new to
+        get a clean context. Only fires for the Claude backend because
+        Cursor / 9Router keep their session metadata in separate tables.
+
+        Best-effort: any storage hiccup is swallowed; we don't block the
+        actual prompt on bookkeeping.
+        """
+        if backend != "claude":
+            return
+
+        threshold = float(self.settings.stale_session_warning_hours)
+        if threshold <= 0:
+            return
+
+        # De-dup per (chat, session) so a back-and-forth in the same stale
+        # window doesn't spam the warning. Cleared automatically when
+        # context.user_data is reset (/new, fresh process).
+        chat_key = getattr(update.effective_chat, "id", "?")
+        flag_key = f"_stale_warned:{chat_key}:{session_id}"
+        if context.user_data.get(flag_key):
+            return
+
+        storage = context.bot_data.get("storage")
+        if not storage:
+            return
+
+        try:
+            session = await storage.sessions.get_session(session_id)
+        except Exception as exc:
+            logger.debug("Stale-session lookup failed", error=str(exc))
+            return
+
+        if not session or not session.last_used:
+            return
+
+        last_used = session.last_used
+        if last_used.tzinfo is None:
+            last_used = last_used.replace(tzinfo=UTC)
+        age_hours = (datetime.now(UTC) - last_used).total_seconds() / 3600
+        if age_hours < threshold:
+            return
+
+        try:
+            await update.message.reply_text(
+                (
+                    f"⚠️ <b>Resuming a {age_hours:.0f}h-old session.</b>\n"
+                    "Long-quiet sessions can drag in stale context — "
+                    "consider <code>/new</code> for a clean slate."
+                ),
+                parse_mode="HTML",
+            )
+            context.user_data[flag_key] = True
+        except Exception as exc:
+            logger.debug("Stale-session warning send failed", error=str(exc))
+
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
         user_override = context.user_data.get("verbose_level")
@@ -1324,6 +1390,11 @@ class MessageOrchestrator:
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
         force_new = bool(context.user_data.get("force_new_session"))
+
+        # Warn once when picking up a long-quiet session (only meaningful when
+        # we're actually going to resume — skip on force_new / brand-new turns).
+        if session_id and not force_new:
+            await self._warn_if_stale_session(update, context, backend, session_id)
 
         # --- Verbose progress tracking via stream callback ---
         tool_log: List[Dict[str, Any]] = []

@@ -244,6 +244,82 @@ async def test_restart_command_sends_sigterm(agentic_settings, deps):
     assert "Restarting" in msg
 
 
+async def test_warn_if_stale_session_fires_once_for_old_claude_session(
+    agentic_settings, deps
+):
+    """A stale Claude session triggers exactly one warning per (chat, session)."""
+    from datetime import UTC, datetime, timedelta
+
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    stale_session = MagicMock()
+    stale_session.last_used = datetime.now(UTC) - timedelta(hours=24)
+
+    storage = MagicMock()
+    storage.sessions.get_session = AsyncMock(return_value=stale_session)
+
+    update = MagicMock()
+    update.effective_chat.id = -111
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {"storage": storage}
+
+    # First call: warning fires.
+    await orchestrator._warn_if_stale_session(update, context, "claude", "sess-1")
+    assert update.message.reply_text.await_count == 1
+    sent = update.message.reply_text.call_args[0][0]
+    assert "old session" in sent
+    assert "/new" in sent
+
+    # Second call: de-dup flag prevents re-warning for the same session/chat.
+    await orchestrator._warn_if_stale_session(update, context, "claude", "sess-1")
+    assert update.message.reply_text.await_count == 1
+
+
+async def test_warn_if_stale_session_skips_fresh_session(agentic_settings, deps):
+    """A recently-used session must not produce any warning."""
+    from datetime import UTC, datetime, timedelta
+
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    fresh_session = MagicMock()
+    fresh_session.last_used = datetime.now(UTC) - timedelta(minutes=5)
+
+    storage = MagicMock()
+    storage.sessions.get_session = AsyncMock(return_value=fresh_session)
+
+    update = MagicMock()
+    update.effective_chat.id = -111
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {"storage": storage}
+
+    await orchestrator._warn_if_stale_session(update, context, "claude", "sess-1")
+    update.message.reply_text.assert_not_awaited()
+
+
+async def test_warn_if_stale_session_skips_non_claude_backend(agentic_settings, deps):
+    """Cursor/9Router sessions use separate tables — skip the warning path."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    storage = MagicMock()
+    storage.sessions.get_session = AsyncMock()  # must not be called
+
+    update = MagicMock()
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {"storage": storage}
+
+    await orchestrator._warn_if_stale_session(update, context, "cursor", "sess-x")
+    storage.sessions.get_session.assert_not_awaited()
+    update.message.reply_text.assert_not_awaited()
+
+
 async def test_cost_command_partial_failure_shows_both_sides(agentic_settings, deps):
     """/cost: one backend's failure must not hide the other backend's data."""
     from unittest.mock import patch
